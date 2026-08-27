@@ -270,7 +270,7 @@ python manage.py stop     # 停止服务
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/your-username/M365-Copilot2API.git
+git clone https://github.com/baico111/M365-Copilot2API.git
 cd M365-Copilot2API
 
 # 2. 一键部署（自动生成密钥、写入密码、构建镜像、启动容器）
@@ -316,7 +316,7 @@ bash deploy.sh
 
 ```bash
 # ─── 第 1 步：克隆代码 ───
-git clone https://github.com/your-username/M365-Copilot2API.git
+git clone https://github.com/baico111/M365-Copilot2API.git
 cd M365-Copilot2API
 
 # ─── 第 2 步：创建配置文件 ───
