@@ -19,7 +19,9 @@ WORKDIR /app
 COPY --from=build /out/m365-copilot2api /app/m365-copilot2api
 COPY --from=build /src/web /app/web
 RUN chown -R m365:m365 /app /data
-USER m365
+# 不切换非 root 用户，因为挂载的宿主机 data 目录权限由宿主机控制
+# 容器内需要 root 权限才能写入挂载目录
+USER root
 EXPOSE 4141
 ENV M365_LISTEN=0.0.0.0:4141 \
     M365_DATA_DIR=/data \
