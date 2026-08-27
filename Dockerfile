@@ -1,5 +1,10 @@
 FROM golang:1.23-alpine AS build
 
+# 使用国内 Go 模块代理，解决 VPS 访问 proxy.golang.org 失败的问题
+ENV GOPROXY=https://goproxy.cn,direct \
+    GOSUMDB=off \
+    GO111MODULE=on
+
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
