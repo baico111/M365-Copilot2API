@@ -1,9 +1,12 @@
 FROM golang:1.23-alpine AS build
 
-# 使用国内 Go 模块代理，解决 VPS 访问 proxy.golang.org 失败的问题
+# 使用国内 Go 模块代理
 ENV GOPROXY=https://goproxy.cn,direct \
     GOSUMDB=off \
     GO111MODULE=on
+
+# 强制使用 IPv6 DNS（纯 IPv6 VPS 需要这个）
+RUN echo -e "nameserver 2606:4700:4700::1111\nnameserver 2001:4860:4860::8888" > /etc/resolv.conf
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -12,6 +15,8 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/m365-copilot2api ./cmd/server
 
 FROM alpine:3.20
+# 强制使用 IPv6 DNS（纯 IPv6 VPS 需要这个）
+RUN echo -e "nameserver 2606:4700:4700::1111\nnameserver 2001:4860:4860::8888" > /etc/resolv.conf
 RUN apk add --no-cache wget ca-certificates tzdata \
     && addgroup -S m365 && adduser -S -G m365 m365 \
     && mkdir -p /data /app

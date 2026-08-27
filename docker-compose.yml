@@ -1,6 +1,8 @@
 services:
   m365-copilot2api:
-    build: .
+    build:
+      context: .
+      network: host
     image: m365-copilot2api:latest
     container_name: m365-copilot2api
     restart: unless-stopped
