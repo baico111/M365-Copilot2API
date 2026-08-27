@@ -7,9 +7,11 @@ services:
     container_name: m365-copilot2api
     restart: unless-stopped
     # 容器内部监听 4141，映射到宿主机 80 端口
+    # 同时监听 IPv4 和 IPv6（纯 IPv6 VPS 必须加 [::]:80）
     # 访问地址: http://你的VPS_IP
     ports:
       - "0.0.0.0:80:4141"
+      - "[::]:80:4141"
     environment:
       M365_LISTEN: 0.0.0.0:4141
       M365_DATA_DIR: /data
