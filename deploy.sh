@@ -96,18 +96,18 @@ sleep 5
 SERVER_IP=$(curl -s ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
 
 for i in $(seq 1 10); do
-    if curl -sf "http://localhost:4141/api/health" >/dev/null 2>&1; then
+    if curl -sf "http://localhost:80/api/health" >/dev/null 2>&1; then
         echo
         echo -e "${GREEN}========================================${NC}"
         echo -e "${GREEN} 部署成功！${NC}"
         echo -e "${GREEN}========================================${NC}"
         echo
-        echo -e "  服务地址:  ${GREEN}http://$SERVER_IP:4141${NC}"
-        echo -e "  控制台:    ${GREEN}http://$SERVER_IP:4141${NC}"
+        echo -e "  服务地址:  ${GREEN}http://$SERVER_IP${NC}"
+        echo -e "  控制台:    ${GREEN}http://$SERVER_IP${NC}"
         echo
         echo -e "  ${YELLOW}Cloudflare DNS 设置:${NC}"
         echo -e "    A 记录 → $SERVER_IP"
-        echo -e "    端口 → 4141 (或用 CF Workers / Origin Rules 代理)"
+        echo -e "    端口 → 80 (CF 代理可开启自动 HTTPS)"
         echo
         echo -e "  ${YELLOW}管理命令:${NC}"
         echo -e "    查看日志:   $COMPOSE_CMD logs -f"

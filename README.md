@@ -262,62 +262,178 @@ python manage.py stop     # 停止服务
 
 ### Docker 部署（推荐 VPS 部署方式）
 
-项目自带 `Dockerfile` 和 `docker-compose.yml`，支持一键部署：
+项目自带 `Dockerfile` 和 `docker-compose.yml`，**容器内部监听 4141，通过端口映射暴露在宿主机 80 端口**，直接通过 `http://你的VPS_IP` 即可访问。
+
+---
+
+#### 方式一：一键脚本部署（推荐新手）
 
 ```bash
 # 1. 克隆仓库
 git clone https://github.com/your-username/M365-Copilot2API.git
 cd M365-Copilot2API
 
-# 2. 一键部署（自动生成密钥、创建配置、构建并启动）
+# 2. 一键部署（自动生成密钥、写入密码、构建镜像、启动容器）
 bash deploy.sh
 ```
 
-或手动操作：
+`deploy.sh` 会自动完成：
+- ✅ 检查 Docker / Docker Compose 是否安装
+- ✅ 复制 `.env.example` 为 `.env`
+- ✅ 用 `openssl` 生成随机 `M365_MASTER_KEY` 并写入 `.env`
+- ✅ 将 `.env` 中的密码写入 `secrets/m365_admin_password`（权限 600）
+- ✅ 构建 Docker 镜像并启动容器
+- ✅ 等待健康检查通过后输出访问地址
 
-```bash
-# 1. 准备配置
-cp .env.example .env
-# 编辑 .env，设置 M365_ADMIN_PASSWORD 和 M365_MASTER_KEY
-# 生成密钥: openssl rand -base64 32
+部署完成后脚本会提示：
 
-# 2. 准备 secrets
-mkdir -p secrets
-echo -n 'your_admin_password' > secrets/m365_admin_password
-chmod 600 secrets/m365_admin_password
+```
+========================================
+ 部署成功！
+========================================
 
-# 3. 构建并启动
-docker compose up -d --build
+  服务地址:  http://你的VPS_IP
+  控制台:    http://你的VPS_IP
 
-# 4. 查看日志
-docker compose logs -f
+  Cloudflare DNS 设置:
+    A 记录 → 你的VPS_IP
+    端口 → 80 (CF 代理可开启自动 HTTPS)
 
-# 5. 查看状态
-docker compose ps
+  管理命令:
+    查看日志:   docker compose logs -f
+    重启服务:   docker compose restart
+    停止服务:   docker compose down
+    更新代码:   git pull && docker compose up -d --build
 ```
 
-部署完成后，服务监听 `0.0.0.0:4141`，通过 `http://你的VPS_IP:4141` 访问控制台。
+> **⚠️ 注意**：`deploy.sh` 运行后会提示你修改 `.env` 中的 `M365_ADMIN_PASSWORD`。请先编辑 `.env` 改好密码，然后重新运行 `deploy.sh`（或手动 `docker compose restart`）。否则默认密码不安全。
 
-#### Cloudflare DNS 解析
+---
 
-1. 在 Cloudflare 添加 A 记录，指向你的 VPS IP
-2. 如果使用 Cloudflare 代理（橙色云），需要在 Cloudflare 的 Origin Rules 中将端口映射到 4141
-3. 或使用 Cloudflare Tunnel 直接代理
+#### 方式二：手动 Docker Compose 部署
 
-#### 环境变量配置
+适合想完全掌控每一步的用户：
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `M365_ADMIN_PASSWORD` | `admin123` | 管理员密码（首次登录强制修改） |
-| `M365_MASTER_KEY` | 自动生成 | Token 加密主密钥（建议显式设置） |
-| `M365_LISTEN` | `0.0.0.0:4141` | 监听地址 |
-| `M365_PUBLIC_IDENTITY_POLICY` | `false` | 公开身份策略 |
-| `M365_CHAT_TIMEOUT_SECONDS` | `120` | 聊天超时（秒） |
-| `M365_IMAGE_TIMEOUT_SECONDS` | `150` | 图片处理超时（秒） |
+```bash
+# ─── 第 1 步：克隆代码 ───
+git clone https://github.com/your-username/M365-Copilot2API.git
+cd M365-Copilot2API
+
+# ─── 第 2 步：创建配置文件 ───
+cp .env.example .env
+
+# 编辑 .env，设置管理员密码
+vim .env
+# 必改项：
+#   M365_ADMIN_PASSWORD=你的强密码
+#   M365_MASTER_KEY=（运行下面命令生成）
+
+# 生成加密主密钥
+openssl rand -base64 32
+# 把输出值粘贴到 .env 的 M365_MASTER_KEY= 后面
+
+# ─── 第 3 步：准备 secrets 文件 ───
+mkdir -p secrets
+# 从 .env 中取密码写入（Docker secrets 机制读取）
+echo -n '你的强密码' > secrets/m365_admin_password
+chmod 600 secrets/m365_admin_password
+
+# ─── 第 4 步：构建并启动 ───
+docker compose up -d --build
+
+# ─── 第 5 步：查看启动日志 ───
+docker compose logs -f
+# 看到 "listening on 0.0.0.0:4141" 表示启动成功，Ctrl+C 退出日志查看
+
+# ─── 第 6 步：验证服务是否正常 ───
+curl http://localhost/api/health
+# 返回 {"status":"ok"} 即正常
+
+# ─── 第 7 步：浏览器访问控制台 ───
+# 打开 http://你的VPS_IP
+```
+
+---
+
+#### 端口说明
+
+| 宿主机端口 | 容器内部端口 | 说明 |
+|-----------|-------------|------|
+| **80** | 4141 | HTTP 访问入口，`http://你的VPS_IP` 直接访问 |
+
+> 如果 80 端口被占用（比如 nginx），可以改 `docker-compose.yml` 中的端口映射：
+> ```yaml
+> ports:
+>   - "8080:4141"  # 改为 8080 端口
+> ```
+> 然后通过 `http://你的VPS_IP:8080` 访问。
+
+---
+
+#### Cloudflare DNS 解析（可选，用域名访问）
+
+如果不想记 IP，想用域名访问：
+
+1. 登录 Cloudflare → 选择你的域名
+2. **DNS** → **添加记录**
+3. 类型：`A`，名称：`@`（或子域名如 `m365`），IPv4 地址：`你的VPS_IP`
+4. 代理状态：
+   - **DNS only（灰色云）**：直接解析到 IP，通过 `http://你的域名` 访问（80 端口）
+   - **Proxied（橙色云）**：Cloudflare 自动提供 HTTPS，但需在 **Origin Rules** 里确保回源端口为 80
+5. 保存，等 DNS 生效（通常 1-2 分钟）
+
+---
+
+#### 常用管理命令
+
+```bash
+# 查看容器状态
+docker compose ps
+
+# 查看实时日志
+docker compose logs -f
+
+# 重启服务
+docker compose restart
+
+# 停止服务
+docker compose down
+
+# 更新代码并重新部署
+git pull
+docker compose up -d --build
+
+# 进入容器调试
+docker compose exec m365-copilot2api sh
+
+# 查看健康状态
+curl http://localhost/api/health
+```
+
+---
+
+#### 防火墙设置
+
+确保 VPS 的 80 端口已开放：
+
+```bash
+# Ubuntu / Debian (ufw)
+sudo ufw allow 80/tcp
+sudo ufw reload
+
+# CentOS / RHEL (firewalld)
+sudo firewall-cmd --permanent --add-port=80/tcp
+sudo firewall-cmd --reload
+
+# 如果云服务商有安全组（如阿里云、腾讯云、AWS）
+# 需在控制台安全组规则中放行 80 端口入站
+```
+
+---
 
 ### 初始化与第一次调用
 
-浏览器打开控制台（默认 `http://127.0.0.1:4141`）：
+浏览器打开控制台（Docker 部署后访问 `http://你的VPS_IP`，本地运行默认 `http://127.0.0.1:4141`）：
 
 1. 用管理员密码登录（首次登录**强制要求修改密码**，默认密码 `admin123`）。
 2. 在「账号」页点击**开始授权**：
