@@ -6,6 +6,7 @@ accounts.json
 *.token
 *.tokens
 *.har
+.masterkey
 cookies*.txt
 /tmp/
 

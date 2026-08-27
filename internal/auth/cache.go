@@ -79,24 +79,87 @@ func CachePath() string {
 	return filepath.Join(h, ".config", "m365-copilot2api", "accounts.json")
 }
 
-// TODO(security): 当前使用 AES-GCM + pepper HMAC-SHA256 派生 (M365_MASTER_KEY) 提供 AEAD 加密与 0600 落盘，
-// 兼容明文迁移。未来迁移到 XChaCha20-Poly1305 (golang.org/x/crypto/chacha20poly1305.NewX, 24-byte nonce)
-// 并将主密钥接入 OS DPAPI/keyring (Windows DPAPI, macOS Keychain, Linux libsecret)，见 TODO 后续。
+// AES-GCM + pepper HMAC-SHA256 派生 (M365_MASTER_KEY) 提供 AEAD 加密与 0600 落盘。
+// 兼容明文迁移。
+//
+// 安全策略:
+//   - 优先从 M365_MASTER_KEY 环境变量读取
+//   - 未设置时，从数据目录的 .masterkey 文件读取
+//   - 文件也不存在时，生成随机密钥并持久化到文件（0600 权限）
+//   - 绝不使用硬编码 fallback 密钥
 const encPrefix = "enc:v1:"
 
+var (
+	masterKeyOnce sync.Once
+	masterKeyVal  []byte
+)
+
 func masterKey() []byte {
+	masterKeyOnce.Do(func() {
+		masterKeyVal = deriveMasterKey()
+	})
+	return masterKeyVal
+}
+
+func deriveMasterKey() []byte {
 	raw := strings.TrimSpace(os.Getenv("M365_MASTER_KEY"))
 	if raw == "" {
 		raw = strings.TrimSpace(os.Getenv("M365_TOKEN_ENCRYPTION_KEY"))
 	}
 	if raw == "" {
-		log.Printf("[security] WARNING: M365_MASTER_KEY not set; refresh tokens are encrypted with a built-in public fallback key. Set M365_MASTER_KEY to protect accounts.json at rest.")
-		raw = "m365-copilot2api-fallback-pepper-v1-TODO-DPAPI-keyring"
+		// 尝试从数据目录读取持久化的随机密钥
+		raw = loadOrGeneratePersistentKey()
 	}
 	pepper := []byte("m365-copilot2api-pepper-v1")
 	mac := hmac.New(sha256.New, pepper)
 	_, _ = mac.Write([]byte(raw))
 	return mac.Sum(nil)
+}
+
+// loadOrGeneratePersistentKey 在 M365_MASTER_KEY 未设置时，从数据目录的
+// .masterkey 文件加载或生成一个新的随机密钥并持久化。这样每个部署有
+// 独立的加密密钥，而不是所有部署共用同一个公开 fallback。
+func loadOrGeneratePersistentKey() string {
+	keyFile := masterKeyPath()
+	// 尝试读取已有密钥
+	if b, err := os.ReadFile(keyFile); err == nil {
+		k := strings.TrimSpace(string(b))
+		if k != "" {
+			log.Printf("[security] M365_MASTER_KEY not set; using persisted key from %s", keyFile)
+			return k
+		}
+	}
+	// 生成新的随机密钥（32 字节 base64 编码）
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		// 极端情况：crypto/rand 失败，退化为时间戳种子的 hash
+		// 这只在非常异常的环境下发生
+		log.Printf("[security] CRITICAL: crypto/rand failed, using time-based fallback: %v", err)
+		return fmt.Sprintf("fallback-%d-%x", time.Now().UnixNano(), sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))
+	}
+	k := base64.StdEncoding.EncodeToString(b)
+	// 持久化到文件
+	dir := filepath.Dir(keyFile)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Printf("[security] WARNING: cannot create key directory %s: %v; key will not persist across restarts", dir, err)
+		return k
+	}
+	if err := writeFileAtomic(keyFile, []byte(k), 0o600); err != nil {
+		log.Printf("[security] WARNING: cannot persist master key to %s: %v; key will not persist across restarts", keyFile, err)
+	}
+	log.Printf("[security] M365_MASTER_KEY not set; generated and persisted random key to %s", keyFile)
+	log.Printf("[security] WARNING: Set M365_MASTER_KEY explicitly in environment for stable encryption across reinstalls.")
+	return k
+}
+
+func masterKeyPath() string {
+	if dir := os.Getenv("M365_DATA_DIR"); dir != "" {
+		return filepath.Join(dir, ".masterkey")
+	}
+	if h, err := os.UserHomeDir(); err == nil && h != "" {
+		return filepath.Join(h, ".config", "m365-copilot2api", ".masterkey")
+	}
+	return filepath.Join(".", ".config", "m365-copilot2api", ".masterkey")
 }
 
 func isEncrypted(s string) bool { return strings.HasPrefix(s, encPrefix) }

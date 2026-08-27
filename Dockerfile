@@ -7,7 +7,8 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/m365-copilot2api ./cmd/server
 
 FROM alpine:3.20
-RUN addgroup -S m365 && adduser -S -G m365 m365 \
+RUN apk add --no-cache wget ca-certificates tzdata \
+    && addgroup -S m365 && adduser -S -G m365 m365 \
     && mkdir -p /data /app
 WORKDIR /app
 COPY --from=build /out/m365-copilot2api /app/m365-copilot2api
@@ -24,4 +25,6 @@ ENV M365_LISTEN=0.0.0.0:4141 \
     M365_ADMIN_PASSWORD_FILE=/data/admin-password \
     M365_ADMIN_PASSWORD_BOOTSTRAP_FILE=/run/secrets/m365_admin_password
 VOLUME ["/data"]
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
+    CMD wget -q --spider http://localhost:4141/api/health || exit 1
 ENTRYPOINT ["/app/m365-copilot2api"]

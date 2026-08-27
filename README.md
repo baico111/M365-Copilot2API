@@ -252,13 +252,68 @@ python manage.py err      # 查看错误日志
 python manage.py stop     # 停止服务
 ```
 
-> `manage.py` 内部硬编码了仓库绝对路径（`D:\M365-Copilot2API\m365-copilot2api.exe` 等），克隆到其他目录时请先修改脚本顶部的路径常量，并确保先完成编译。
+> `manage.py` 跨平台兼容（Linux / macOS / Windows），自动检测可执行文件路径，无需修改硬编码路径。
+>
+> 首次使用前先编译：`go build -o m365-copilot2api ./cmd/server`（Windows 为 `.exe`）。
+>
+> `manage.py genkey` 可生成随机 `M365_MASTER_KEY`，用于加密 refresh token。
 
 直接运行二进制则默认只监听内网 `http://127.0.0.1:4141`，可通过环境变量 `M365_LISTEN` 覆盖。
 
-### Docker 部署
+### Docker 部署（推荐 VPS 部署方式）
 
-> 官方不提供 Dockerfile。如需容器化部署，可自行基于预编译二进制或源码构建镜像，或在 Discussions 交流社区方案。
+项目自带 `Dockerfile` 和 `docker-compose.yml`，支持一键部署：
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/your-username/M365-Copilot2API.git
+cd M365-Copilot2API
+
+# 2. 一键部署（自动生成密钥、创建配置、构建并启动）
+bash deploy.sh
+```
+
+或手动操作：
+
+```bash
+# 1. 准备配置
+cp .env.example .env
+# 编辑 .env，设置 M365_ADMIN_PASSWORD 和 M365_MASTER_KEY
+# 生成密钥: openssl rand -base64 32
+
+# 2. 准备 secrets
+mkdir -p secrets
+echo -n 'your_admin_password' > secrets/m365_admin_password
+chmod 600 secrets/m365_admin_password
+
+# 3. 构建并启动
+docker compose up -d --build
+
+# 4. 查看日志
+docker compose logs -f
+
+# 5. 查看状态
+docker compose ps
+```
+
+部署完成后，服务监听 `0.0.0.0:4141`，通过 `http://你的VPS_IP:4141` 访问控制台。
+
+#### Cloudflare DNS 解析
+
+1. 在 Cloudflare 添加 A 记录，指向你的 VPS IP
+2. 如果使用 Cloudflare 代理（橙色云），需要在 Cloudflare 的 Origin Rules 中将端口映射到 4141
+3. 或使用 Cloudflare Tunnel 直接代理
+
+#### 环境变量配置
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `M365_ADMIN_PASSWORD` | `admin123` | 管理员密码（首次登录强制修改） |
+| `M365_MASTER_KEY` | 自动生成 | Token 加密主密钥（建议显式设置） |
+| `M365_LISTEN` | `0.0.0.0:4141` | 监听地址 |
+| `M365_PUBLIC_IDENTITY_POLICY` | `false` | 公开身份策略 |
+| `M365_CHAT_TIMEOUT_SECONDS` | `120` | 聊天超时（秒） |
+| `M365_IMAGE_TIMEOUT_SECONDS` | `150` | 图片处理超时（秒） |
 
 ### 初始化与第一次调用
 
@@ -549,14 +604,17 @@ M365-Copilot2API/
 │   ├── test-recorder.ps1  # Windows 测试录制
 │   └── m365-upload-forensic-trace.user.js  # 上传取证脚本
 ├── docs/screenshots/      # 界面截图
-├── manage.py              # start / stop / status / logs / err 进程管理
+├── manage.py              # 跨平台管理脚本（start/stop/status/logs/genkey）
+├── deploy.sh              # Docker 一键部署脚本
+├── .env.example            # Docker 环境变量模板
 ├── docker-compose.yml · Dockerfile
 └── data/                  # 运行数据（由 M365_DATA_DIR 指定）
 ```
 
 ## 安全说明
 
-- **默认仅监听内网**：直接运行二进制默认 `M365_LISTEN=127.0.0.1:4141`；对外提供服务务必通过 TLS 终泄反向代理（Nginx / Caddy），并为 SSE 与 WebSocket 开启长连接与 `proxy_buffering off`。
+- **默认仅监听内网**：直接运行二进制默认 `M365_LISTEN=127.0.0.1:4141`；Docker 部署模式默认 `0.0.0.0:4141`（监听所有网卡）。对外暴露建议通过 Cloudflare 代理或反向代理，确保 TLS 加密。
+- **Token 加密**：refresh token 使用 AES-GCM 加密落盘。优先从 `M365_MASTER_KEY` 环境变量读取密钥；未设置时自动生成随机密钥并持久化到数据目录的 `.masterkey` 文件（`0600` 权限），每个部署独立密钥，**绝不使用硬编码 fallback**。建议显式设置 `M365_MASTER_KEY` 以保证重新部署后密钥不变。
 - **首次登录强制改密**：使用默认密码或引导密码完成首次登录后必须修改管理员密码。
 - **密钥最小暴露**：API Key 控制台创建后即可回读，请妥善保护控制台访问权限。
 - **数据落盘权限**：账号凭据、Token 缓存、会话绑定、API Key 等数据文件以 `0600` 权限写入，数据目录建议 `0700`。请定期备份数据目录。

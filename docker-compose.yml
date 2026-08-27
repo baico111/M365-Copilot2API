@@ -4,8 +4,10 @@ services:
     image: m365-copilot2api:latest
     container_name: m365-copilot2api
     restart: unless-stopped
+    # 直接监听 0.0.0.0:4141，配合 Cloudflare DNS 解析即可外网访问
+    # 如需仅本机访问（再自行反代），改为 "127.0.0.1:4141:4141"
     ports:
-      - "127.0.0.1:4141:4141"
+      - "0.0.0.0:4141:4141"
     environment:
       M365_LISTEN: 0.0.0.0:4141
       M365_DATA_DIR: /data
@@ -18,6 +20,19 @@ services:
       M365_CHAT_TIMEOUT_SECONDS: "120"
       M365_IMAGE_TIMEOUT_SECONDS: "150"
       M365_PUBLIC_IDENTITY_POLICY: "${M365_PUBLIC_IDENTITY_POLICY:-false}"
+      # Token 加密主密钥 — 强烈建议设置，生成方法: openssl rand -base64 32
+      M365_MASTER_KEY: "${M365_MASTER_KEY:-}"
     volumes:
       - ./data:/data
       - ./secrets/m365_admin_password:/run/secrets/m365_admin_password:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4141/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
