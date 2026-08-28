@@ -501,6 +501,22 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		s.responseMu.Unlock()
 		log.Printf("[responses-audit] tenantHash=%s session=%s new=%s parent=%s toolCalls=%d version=1", tenantHashPrefix(tenant), sessionHashPrefix(sessionID), publicID, body.PreviousResponseID, len(toolCallsMap))
 	}
+	if msg, _ := openAIChoice(out); msg != nil {
+		hasCalls := false
+		if calls, ok := msg["tool_calls"].([]any); ok && len(calls) > 0 {
+			hasCalls = true
+			for _, raw := range calls {
+				if tc, ok := raw.(map[string]any); ok {
+					fn, _ := tc["function"].(map[string]any)
+					log.Printf("[responses-output] pre_write tool_call id=%v type=%v name=%v args_type=%T args_val=%.200v", tc["id"], tc["type"], fn["name"], fn["arguments"], fn["arguments"])
+				}
+			}
+		}
+		if !hasCalls {
+			text, _ := msg["content"].(string)
+			log.Printf("[responses-output] pre_write message text_len=%d preview=%.200s", len(text), text)
+		}
+	}
 	writeResponsesResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)
 }
 

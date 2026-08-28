@@ -124,6 +124,7 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 			break
 		}
 	}
+	toolNames := map[string]bool{}
 	for _, t := range r.Tools {
 		typ, _ := t["type"].(string)
 		name, _ := t["name"].(string)
@@ -136,10 +137,13 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 			// grammar-constrained raw input string. Preserve the distinction in
 			// Tool.Type and bridge the input through a single string field.
 			f["parameters"] = map[string]any{"type": "object", "properties": map[string]any{"input": map[string]any{"type": "string"}}, "required": []string{"input"}, "additionalProperties": false}
-			hasCustomExec = true
 		} else if typ != "function" {
 			continue
 		}
+		if toolNames[name] {
+			continue
+		}
+		toolNames[name] = true
 		b, _ := json.Marshal(f)
 		o.Tools = append(o.Tools, chathub.Tool{Type: typ, Function: b})
 	}

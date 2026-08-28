@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -21,10 +22,14 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 			tc, _ := raw.(map[string]any)
 			fn, _ := tc["function"].(map[string]any)
 			if tc["type"] == "custom" {
-				output = append(output, map[string]any{"type": "custom_tool_call", "id": "ctc_" + uuid.NewString(), "call_id": tc["id"], "name": fn["name"], "input": customToolInput(fn["arguments"]), "status": "completed"})
+				input := customToolInput(fn["arguments"])
+				output = append(output, map[string]any{"type": "custom_tool_call", "id": "ctc_" + uuid.NewString(), "call_id": tc["id"], "name": fn["name"], "input": input, "status": "completed"})
+				log.Printf("[responses-output] type=custom_tool_call name=%s call_id=%v input_len=%d", fn["name"], tc["id"], len(input))
 				continue
 			}
-			output = append(output, map[string]any{"type": "function_call", "id": "fc_" + uuid.NewString(), "call_id": tc["id"], "name": fn["name"], "arguments": fn["arguments"], "status": "completed"})
+			args := ensureJSONString(fn["arguments"])
+			output = append(output, map[string]any{"type": "function_call", "id": "fc_" + uuid.NewString(), "call_id": tc["id"], "name": fn["name"], "arguments": args, "status": "completed"})
+			log.Printf("[responses-output] type=function_call name=%s call_id=%v args_len=%d", fn["name"], tc["id"], len(args))
 		}
 	} else {
 		text, _ := msg["content"].(string)
@@ -103,4 +108,29 @@ func customToolInput(arguments any) string {
 		}
 	}
 	return ""
+}
+
+// ensureJSONString guarantees that arguments is a valid JSON string.
+// If the value is already a string, it is returned as-is if it parses as
+// JSON; otherwise it is wrapped in braces. Non-string values are marshalled.
+func ensureJSONString(v any) string {
+	if v == nil {
+		return "{}"
+	}
+	if s, ok := v.(string); ok {
+		if s == "" {
+			return "{}"
+		}
+		var probe any
+		if json.Unmarshal([]byte(s), &probe) == nil {
+			return s
+		}
+		b, _ := json.Marshal(s)
+		return string(b)
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
