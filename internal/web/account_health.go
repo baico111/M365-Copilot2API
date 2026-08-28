@@ -264,7 +264,7 @@ func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Du
 	case CategoryAuthExpired401:
 		return 2 * time.Minute
 	case CategoryForbidden403:
-		return 24 * time.Hour
+		return 1 * time.Hour
 	case CategoryUserBanned:
 		return 365 * 24 * time.Hour
 	case CategoryUserThrottled:

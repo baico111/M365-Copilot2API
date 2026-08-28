@@ -95,8 +95,8 @@ func applyM365Headers(w http.ResponseWriter, err error, accountID string) {
 			w.Header().Set("X-M365-Retry-After", "120")
 			w.Header().Set("X-M365-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(2*time.Minute).Unix()))
 		case CategoryForbidden403:
-			w.Header().Set("X-M365-Retry-After", "86400")
-			w.Header().Set("X-M365-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(24*time.Hour).Unix()))
+			w.Header().Set("X-M365-Retry-After", "3600")
+			w.Header().Set("X-M365-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(1*time.Hour).Unix()))
 		}
 	}
 	if IsRateLimited(err) {
@@ -137,6 +137,11 @@ func writeUpstreamErrorWithAccount(w http.ResponseWriter, err error, accountID s
 	writeOpenAIError(w, status, "upstream_error", upstreamError(err))
 }
 
+// IsRetryable returns true for errors that warrant a failover attempt on
+// the next healthy account: rate limits, auth failures, and all transport
+// errors (DNS, TCP, TLS, WebSocket handshake/read timeout, etc.).
+// Forbidden 403 that is not ErrorDisallowedAADUser is also retried because
+// it can be a transient edge node rejection. UserBanned is never retried.
 func IsRetryable(err error) bool {
 	if err == nil {
 		return false
@@ -146,13 +151,20 @@ func IsRetryable(err error) bool {
 	case CategoryQuota429, CategoryOverload503, CategoryRetryable422,
 		CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS,
 		CategoryWSHandshake, CategoryWSReadTimeout, CategoryUpstreamStructured,
-		CategoryGlobalUnavailable:
+		CategoryGlobalUnavailable, CategoryAuthExpired401:
 		return true
-	case CategoryForbidden403, CategoryAuthExpired401,
-		CategoryUserBanned, CategoryClientCanceled:
+	case CategoryForbidden403:
+		// ErrorDisallowedAADUser is a permanent Designer-disabled state, not retryable.
+		// Other 403s may be transient edge-node rejections.
+		var httpErr *UpstreamHTTPError
+		if errors.As(err, &httpErr) && httpErr.ErrorCode == "ErrorDisallowedAADUser" {
+			return false
+		}
+		return true
+	case CategoryUserBanned, CategoryClientCanceled:
 		return false
 	default:
-		return false
+		return true
 	}
 }
 

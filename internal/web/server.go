@@ -352,6 +352,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)
 	m.HandleFunc("/api/accounts/provision", s.provisionAccount)
 	m.HandleFunc("/api/accounts/bind-proxy", s.bindProxy)
+	m.HandleFunc("/api/accounts/probe", s.probeAccount)
 	m.HandleFunc("/api/auth/start", s.startPKCE)
 	m.HandleFunc("/api/auth/status", s.pkceStatus)
 	m.HandleFunc("/api/auth/callback", s.callbackPKCE)
@@ -797,6 +798,126 @@ func (s *Server) clearCooldown(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, map[string]any{"status": "ok"})
 }
 
+// probeAccount tests one or all accounts by sending a lightweight chat request
+// to verify the account is actually alive. Returns per-account results with
+// status, error category, cooldown reason, and timing.
+func (s *Server) probeAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
+		return
+	}
+	var body struct {
+		ID    string `json:"id"`
+		All   bool   `json:"all"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "bad json")
+		return
+	}
+
+	type probeResult struct {
+		ID            string `json:"id"`
+		Email         string `json:"email"`
+		DisplayName  string `json:"displayName"`
+		Alive         bool   `json:"alive"`
+		Status        string `json:"status"`
+		ErrorCategory string `json:"errorCategory,omitempty"`
+		ErrorReason   string `json:"errorReason,omitempty"`
+		CooldownUntil *time.Time `json:"cooldownUntil,omitempty"`
+		LatencyMS     int64 `json:"latencyMs"`
+	}
+
+	probeOne := func(acc auth.AccountToken) probeResult {
+		result := probeResult{
+			ID:       acc.ID,
+			Email:    acc.Email,
+			DisplayName: acc.DisplayName,
+		}
+
+		// Check if account is in cooldown
+		if until, ok := s.accountPool.CooldownUntil(acc.ID); ok {
+			result.CooldownUntil = &until
+			if time.Now().Before(until) {
+				result.Status = "cooldown"
+				result.ErrorReason = s.accountPool.AuthFailReason(acc.ID)
+			}
+		}
+
+		// Ensure token is valid
+		validToken, err := s.tokens.EnsureValid(acc.ID)
+		if err != nil {
+			result.ErrorCategory = "token_refresh_failed"
+			result.ErrorReason = err.Error()
+			result.Status = "offline"
+			return result
+		}
+
+		// Send a minimal probe request
+		probeCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		start := time.Now()
+		_, chatErr := s.chatWithAccount(probeCtx, acc.ID, chathub.Account{
+			AccessToken: validToken.AccessToken,
+			OID:         validToken.OID,
+			TID:         validToken.TID,
+		}, chathub.Request{
+			Text:         "hi",
+			Tone:         "Magic",
+			LicenseType:  s.settings.get().LicenseType,
+			Scenario:     s.settings.get().Scenario,
+			FeatureFlags: s.featureFlags(),
+		})
+		result.LatencyMS = time.Since(start).Milliseconds()
+
+		if chatErr != nil {
+			cat := ClassifyError(chatErr)
+			result.ErrorCategory = string(cat)
+			result.ErrorReason = s.accountPool.AuthFailReason(acc.ID)
+			if result.ErrorReason == "" {
+				result.ErrorReason = chatErr.Error()
+			}
+			result.Status = "offline"
+			result.Alive = false
+			return result
+		}
+
+		s.accountPool.MarkSuccess(acc.ID)
+		result.Alive = true
+		result.Status = "online"
+		return result
+	}
+
+	if body.All {
+		// Probe all accounts
+		list := s.tokens.List()
+		results := make([]probeResult, 0, len(list))
+		for _, acc := range list {
+			results = append(results, probeOne(acc))
+		}
+		alive := 0
+		for _, r := range results {
+			if r.Alive {
+				alive++
+			}
+		}
+		jsonOut(w, map[string]any{"results": results, "total": len(results), "alive": alive})
+		return
+	}
+
+	// Probe single account
+	if body.ID == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "id or all=true required")
+		return
+	}
+	acc, err := s.tokens.EnsureValid(body.ID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "token_refresh_error", err.Error())
+		return
+	}
+	result := probeOne(acc)
+	jsonOut(w, map[string]any{"result": result})
+}
+
 func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
@@ -1091,18 +1212,64 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 // healthy, skipping the given id first, and validates its token. Used by the
 // failover path after a rate-limited or auth-failed attempt.
 func (s *Server) nextHealthyAccount(avoidID string) (auth.AccountToken, error) {
-	for i := 0; i < maxAccountProbe; i++ {
+	// Try all accounts, not just maxAccountProbe, since the pool may be large.
+	seen := make(map[string]bool)
+	for i := 0; i < 256; i++ {
 		acc, ok := s.tokens.Next()
 		if !ok {
-			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
+			break
 		}
+		if seen[acc.ID] {
+			break // wrapped around — all accounts probed
+		}
+		seen[acc.ID] = true
 		if avoidID != "" && acc.ID == avoidID {
 			continue
 		}
 		if !s.accountAvailable(acc.ID) {
 			continue
 		}
-		return s.tokens.EnsureValid(acc.ID)
+		if !s.accountPool.Available(acc.ID) {
+			continue
+		}
+		if !s.accountConcurrency.Available(acc.ID) {
+			continue
+		}
+		if token, err := s.tokens.EnsureValid(acc.ID); err == nil {
+			return token, nil
+		}
+	}
+	return auth.AccountToken{}, fmt.Errorf("no healthy account available for failover")
+}
+
+// nextHealthyAccountMulti is like nextHealthyAccount but skips all IDs in the
+// tried set, allowing the failover loop to iterate through every account.
+func (s *Server) nextHealthyAccountMulti(tried map[string]bool) (auth.AccountToken, error) {
+	seen := make(map[string]bool)
+	for i := 0; i < 256; i++ {
+		acc, ok := s.tokens.Next()
+		if !ok {
+			break
+		}
+		if seen[acc.ID] {
+			break // wrapped around
+		}
+		seen[acc.ID] = true
+		if tried[acc.ID] {
+			continue
+		}
+		if !s.accountAvailable(acc.ID) {
+			continue
+		}
+		if !s.accountPool.Available(acc.ID) {
+			continue
+		}
+		if !s.accountConcurrency.Available(acc.ID) {
+			continue
+		}
+		if token, err := s.tokens.EnsureValid(acc.ID); err == nil {
+			return token, nil
+		}
 	}
 	return auth.AccountToken{}, fmt.Errorf("no healthy account available for failover")
 }
@@ -1241,15 +1408,23 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		originalErr := err
-		// Failover: a rate-limited or auth-failed account must not take down the
-		// request when the pool has other healthy accounts. Only auto-selected
-		// requests fail over; an explicitly chosen account is respected, and a
-		// conversation-bound chat stays on its account.
-		if body.AccountID == "" && body.ConversationID == "" && (IsRateLimited(err) || IsAuthFailure(err)) {
-			next, nerr := s.nextHealthyAccount(acc.ID)
-			if nerr == nil {
+		// Failover: iterate through ALL healthy accounts until one succeeds.
+		// Only auto-selected requests fail over; an explicitly chosen account
+		// is respected, and a conversation-bound chat stays on its account.
+		if body.AccountID == "" && body.ConversationID == "" && IsRetryable(err) {
+			tried := make(map[string]bool)
+			tried[acc.ID] = true
+			for {
+				s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
+				if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(acc.ID)
+				}
+				next, nerr := s.nextHealthyAccountMulti(tried)
+				if nerr != nil {
+					break // no more healthy accounts
+				}
+				tried[next.ID] = true
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-				defer cancel2()
 				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{
 					Text:                  text,
 					Tone:                  body.Tone,
@@ -1263,21 +1438,24 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 					ConnectedFederatedIDs: body.ConnectedFederatedIDs,
 					FeatureFlags:          s.featureFlags(),
 				})
+				cancel2()
 				if err2 == nil {
-					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(acc.ID)
-					}
 					s.accountPool.MarkSuccess(next.ID)
 					acc = next
 					res = res2
 					err = nil
-				} else {
-					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
-					if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(next.ID)
-					}
-					err = err2
+					break
+				}
+				// This account also failed; mark it and continue to the next
+				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+				if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(next.ID)
+				}
+				originalErr = err2
+				acc = next
+				err = err2
+				if !IsRetryable(err2) {
+					break // non-retryable error, stop trying
 				}
 			}
 		}
@@ -1999,7 +2177,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			return nil
 		})
-		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && (IsRateLimited(err) || IsAuthFailure(err)) {
+		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsRetryable(err) {
 			originalErr := err
 			// A throttled stream may retry on the next healthy account: only the
 			// ": connected" preamble reached the client, so the retried stream is
@@ -2198,7 +2376,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 		if routeErr != nil {
 			s.accountPool.MarkFailure(acc.ID, routeErr, s.getRateLimitCooldown())
-			if IsRateLimited(routeErr) || IsAuthFailure(routeErr) {
+			if IsRetryable(routeErr) {
 				next, nerr := s.nextHealthyAccount(acc.ID)
 				if nerr == nil {
 					ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
@@ -2358,7 +2536,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return onReasoning(reasoning)
 		}
 		res, err = s.chatWithAccountReasoning(ctx, acc.ID, account, answerReq, onDeltaWrapped, onReasoningWrapped)
-		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && (IsRateLimited(err) || IsAuthFailure(err)) {
+		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsRetryable(err) {
 			originalErr := err
 			next, nerr := s.nextHealthyAccount(acc.ID)
 			if nerr == nil {
@@ -2473,7 +2651,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				err = nil
 			}
 		}
-		if err != nil && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && (IsRateLimited(err) || IsAuthFailure(err)) {
+		if err != nil && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsRetryable(err) {
 			originalErr := err
 			// Failover only when nothing pins the request to a conversation or
 			// account; a fresh chat can safely retry on the next healthy account.

@@ -535,9 +535,10 @@ if (response.output_text) {
                 <button data-f="cooldown" onclick="setAccountFilter('cooldown')">Cooldown</button>
                 <button data-f="offline" onclick="setAccountFilter('offline')">Offline</button>
               </div>
+              <button class="btn primary" id="probeAllBtn" onclick="probeAllAccounts()" style="white-space:nowrap"><i data-lucide="zap" style="width:14px;height:14px"></i> Probe all</button>
             </div>
           </div>
-          <table class="table"><thead><tr><th>Account</th><th>Calls</th><th>Status</th><th>Updated</th><th>Scheduling</th><th>Proxy</th><th>Actions</th></tr></thead><tbody id="accountRows"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody></table>
+          <table class="table"><thead><tr><th>Account</th><th>Calls</th><th>Status</th><th>Reason</th><th>Updated</th><th>Scheduling</th><th>Proxy</th><th>Actions</th></tr></thead><tbody id="accountRows"><tr><td colspan="8" class="empty">Loading...</td></tr></tbody></table>
         </div>
       </section>
 
@@ -1080,15 +1081,16 @@ function renderAccounts(){
     const calls=x.rateLimited?`Limited after ${x.callCount||0} calls`:`Called ${x.callCount||0} times`;
     const scheduleEnabled=x.scheduleEnabled!==false;
     const proxyLabel=x.boundProxy?`<span style="font-size:11px;word-break:break-all">${esc(x.boundProxy)}</span>`:'<span style="color:var(--muted);font-size:11px">—</span>';
-    return `<tr><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div></div></div></td><td style="font-size:12px;white-space:nowrap">${calls}</td><td>${status}</td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><button class="btn-sm btn${scheduleEnabled?'':' danger'}" onclick="toggleAccountSchedule('${x.id}',${!scheduleEnabled})">${scheduleEnabled?'Enabled':'Disabled'}</button></td><td>${proxyLabel} <button class="btn-sm btn" style="margin-top:2px" onclick="bindAccountProxy('${x.id}','${esc(x.boundProxy||'')}')">Bind</button></td><td><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></td></tr>`;
-  }).join(''):'<tr><td colspan="7" class="empty">No matching accounts</td></tr>';
+    const reason=x.authFailReason?`<span style="font-size:11px;color:var(--red)">${esc(x.authFailReason)}</span>`:(x.cooldownUntil?'<span style="font-size:11px;color:#d97706">cooldown</span>':'<span style="color:var(--muted);font-size:11px">—</span>');
+    return `<tr><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div></div></div></td><td style="font-size:12px;white-space:nowrap">${calls}</td><td>${status}</td><td>${reason}</td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><button class="btn-sm btn${scheduleEnabled?'':' danger'}" onclick="toggleAccountSchedule('${x.id}',${!scheduleEnabled})">${scheduleEnabled?'Enabled':'Disabled'}</button></td><td>${proxyLabel} <button class="btn-sm btn" style="margin-top:2px" onclick="bindAccountProxy('${x.id}','${esc(x.boundProxy||'')}')">Bind</button></td><td style="white-space:nowrap"><button class="btn-sm btn" onclick="probeOneAccount('${x.id}')" style="margin-right:4px">Probe</button><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></td></tr>`;
+  }).join(''):'<tr><td colspan="8" class="empty">No matching accounts</td></tr>';
 }
 async function loadAccounts(){
   try{
     const d=await api('/api/accounts');
     _accountsCache=d.accounts||[];
     renderAccounts();
-  }catch(e){$('accountRows').innerHTML=`<tr><td colspan="7" class="empty">${e.message}</td></tr>`;}
+  }catch(e){$('accountRows').innerHTML=`<tr><td colspan="8" class="empty">${e.message}</td></tr>`;}
 }
 
 async function toggleAccountSchedule(id,enabled){
@@ -1110,6 +1112,36 @@ function bindAccountProxy(id,current){
   const url=prompt('Bind proxy for this account (socks5://, http://, https://). Leave empty to unbind:',current||'');
   if(url===null)return;
   api('/api/accounts/bind-proxy',{method:'POST',body:JSON.stringify({id,proxyUrl:url.trim()})}).then(()=>{showNotice(url.trim()?'Proxy bound':'Proxy unbound','success');loadAccounts();}).catch(e=>showNotice(e.message,'error'));
+}
+
+async function probeOneAccount(id){
+  showNotice('Probing account...','');
+  try{
+    const d=await api('/api/accounts/probe',{method:'POST',body:JSON.stringify({id})});
+    const r=d.result;
+    if(r.alive){
+      showNotice(`✅ ${r.email||r.id} is alive (${r.latencyMs}ms)`,'success');
+    }else{
+      const reason=r.errorReason||r.errorCategory||'unknown';
+      showNotice(`❌ ${r.email||r.id} offline: ${reason}`,'error');
+    }
+    loadAccounts();
+  }catch(e){showNotice(e.message,'error');}
+}
+
+async function probeAllAccounts(){
+  const btn=$('probeAllBtn');
+  btn.disabled=true;btn.innerHTML='<span style="opacity:0.7">Probing...</span>';
+  showNotice('Probing all accounts, please wait...','');
+  try{
+    const d=await api('/api/accounts/probe',{method:'POST',body:JSON.stringify({all:true})});
+    const results=d.results||[];
+    const alive=d.alive||0;
+    const total=d.total||results.length;
+    showNotice(`Probe complete: ${alive}/${total} alive`,'success');
+    loadAccounts();
+  }catch(e){showNotice(e.message,'error');}
+  finally{btn.disabled=false;btn.innerHTML='<i data-lucide="zap" style="width:14px;height:14px"></i> Probe all';lucide.createIcons();}
 }
 
 async function startPKCE(){
