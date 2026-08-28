@@ -13,7 +13,10 @@ import (
 // writeResponsesResult projects an internal OpenAI-style result into the
 // Responses events and completion shape consumed by Codex.
 func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src map[string]any) {
-	id := firstNonEmpty(fmt.Sprint(src["m365_response_id"]), "resp_"+uuid.NewString())
+	id, _ := src["m365_response_id"].(string)
+	if id == "" {
+		id = "resp_" + uuid.NewString()
+	}
 	msg, _ := openAIChoice(src)
 	sanitizePublicAssistantMessage(msg, model)
 	var output []any
@@ -21,15 +24,20 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 		for _, raw := range calls {
 			tc, _ := raw.(map[string]any)
 			fn, _ := tc["function"].(map[string]any)
+			callID, _ := tc["id"].(string)
+			if callID == "" {
+				callID = "call_" + uuid.NewString()
+			}
+			nameStr, _ := fn["name"].(string)
 			if tc["type"] == "custom" {
 				input := customToolInput(fn["arguments"])
-				output = append(output, map[string]any{"type": "custom_tool_call", "id": "ctc_" + uuid.NewString(), "call_id": tc["id"], "name": fn["name"], "input": input, "status": "completed"})
-				log.Printf("[responses-output] type=custom_tool_call name=%s call_id=%v input_len=%d", fn["name"], tc["id"], len(input))
+				output = append(output, map[string]any{"type": "custom_tool_call", "id": "ctc_" + uuid.NewString(), "call_id": callID, "name": nameStr, "input": input, "status": "completed"})
+				log.Printf("[responses-output] type=custom_tool_call name=%s call_id=%s input_len=%d", nameStr, callID, len(input))
 				continue
 			}
 			args := ensureJSONString(fn["arguments"])
-			output = append(output, map[string]any{"type": "function_call", "id": "fc_" + uuid.NewString(), "call_id": tc["id"], "name": fn["name"], "arguments": args, "status": "completed"})
-			log.Printf("[responses-output] type=function_call name=%s call_id=%v args_len=%d", fn["name"], tc["id"], len(args))
+			output = append(output, map[string]any{"type": "function_call", "id": "fc_" + uuid.NewString(), "call_id": callID, "name": nameStr, "arguments": args, "status": "completed"})
+			log.Printf("[responses-output] type=function_call name=%s call_id=%s args_len=%d", nameStr, callID, len(args))
 		}
 	} else {
 		text, _ := msg["content"].(string)
