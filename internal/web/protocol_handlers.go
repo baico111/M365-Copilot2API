@@ -413,6 +413,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, raw, status, err := s.runOpenAIAdapter(r, o)
+	log.Printf("[responses] adapter_done status=%d raw_len=%d err=%v has_content=%t", status, len(raw), err, responsesOutputHasContent(out))
 	if status >= 400 {
 		writeResponsesError(w, status, "upstream_error", errorMessage(raw, "upstream protocol error"))
 		return
