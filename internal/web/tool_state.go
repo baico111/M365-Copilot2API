@@ -3,8 +3,9 @@ package web
 import "fmt"
 
 // validateToolConversation enforces the OpenAI tool protocol without making
-// assumptions about what a tool does. Every assistant call must be followed by
-// exactly one matching tool result before another model turn is requested.
+// assumptions about what a tool does. Multiple consecutive assistant tool-call
+// messages are allowed (the Responses API / Codex may emit several function_call
+// items in one turn); results must eventually resolve every pending id.
 func validateToolConversation(messages []oaiMsg) error {
 	if len(messages) > 0 {
 		first := messages[0].Role
@@ -14,11 +15,14 @@ func validateToolConversation(messages []oaiMsg) error {
 	}
 	pending := map[string]bool{}
 	completed := map[string]bool{}
+	// Track unresolved assistant indices for diagnostics.
+	unresolvedAssistantIdx := []int{}
 	for i, m := range messages {
 		switch m.Role {
 		case "assistant":
+			// Record unresolved calls from previous assistant turns.
 			if len(pending) > 0 {
-				return fmt.Errorf("tool results missing before assistant message at index %d", i)
+				unresolvedAssistantIdx = append(unresolvedAssistantIdx, i)
 			}
 			for _, call := range m.ToolCalls {
 				id, _ := call["id"].(string)
@@ -43,7 +47,7 @@ func validateToolConversation(messages []oaiMsg) error {
 	}
 	if len(pending) > 0 {
 		for id := range pending {
-			return fmt.Errorf("missing tool result for tool_call_id: %s", id)
+			return fmt.Errorf("missing tool result for tool_call_id: %s (unresolved assistant turns at indices: %v)", id, unresolvedAssistantIdx)
 		}
 	}
 	return nil

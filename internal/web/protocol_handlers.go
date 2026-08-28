@@ -304,9 +304,14 @@ func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []
 	r2.ContentLength = int64(len(b))
 	rr := httptest.NewRecorder()
 	s.openaiChat(rr, r2)
+	status := rr.Code
+	if status == 0 {
+		status = http.StatusOK
+	}
+	log.Printf("[responses] adapter_raw status=%d body_len=%d body_preview=%.200s", status, rr.Body.Len(), rr.Body.String())
 	var out map[string]any
 	err := json.Unmarshal(rr.Body.Bytes(), &out)
-	return out, rr.Body.Bytes(), rr.Code, err
+	return out, rr.Body.Bytes(), status, err
 }
 
 func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
