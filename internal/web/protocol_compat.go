@@ -54,12 +54,74 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 		}
 		o.Messages = append(o.Messages, oaiMsg{Role: "user", Content: v})
 	case []any:
+		// First pass: collect all call_ids from tool outputs so we can detect
+		// which pending tool calls still have results coming.
+		outputCallIDs := map[string]bool{}
 		for _, raw := range v {
 			m, ok := raw.(map[string]any)
 			if !ok {
 				continue
 			}
 			typ, _ := m["type"].(string)
+			if typ != "function_call_output" && typ != "custom_tool_call_output" {
+				continue
+			}
+			if id, _ := m["call_id"].(string); strings.TrimSpace(id) != "" {
+				outputCallIDs[strings.TrimSpace(id)] = true
+			}
+		}
+
+		// Buffer consecutive function_call/custom_tool_call items into a single
+		// assistant message with multiple tool_calls, mirroring the Chat
+		// Completions protocol where one assistant turn can carry several
+		// parallel tool invocations.  Also defer any non-tool-call messages that
+		// appear between an assistant(tool_calls) and its tool results so the
+		// strict adjacency required by many backends is preserved.
+		var pendingToolCalls []map[string]any
+		var pendingToolCallIDs []string
+		awaitingToolOutputs := map[string]bool{}
+		var deferredMsgs []oaiMsg
+
+		flushPendingToolCalls := func() {
+			if len(pendingToolCalls) == 0 {
+				return
+			}
+			o.Messages = append(o.Messages, oaiMsg{Role: "assistant", ToolCalls: pendingToolCalls})
+			for _, id := range pendingToolCallIDs {
+				if strings.TrimSpace(id) != "" {
+					awaitingToolOutputs[id] = true
+				}
+			}
+			pendingToolCalls = pendingToolCalls[:0]
+			pendingToolCallIDs = pendingToolCallIDs[:0]
+		}
+		flushDeferred := func() {
+			for _, msg := range deferredMsgs {
+				o.Messages = append(o.Messages, msg)
+			}
+			deferredMsgs = deferredMsgs[:0]
+		}
+		hasAwaitingOutput := func() bool {
+			for id := range awaitingToolOutputs {
+				if outputCallIDs[id] {
+					return true
+				}
+			}
+			return false
+		}
+
+		for _, raw := range v {
+			m, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			typ, _ := m["type"].(string)
+
+			// Non tool-call items flush pending tool calls first
+			if typ != "function_call" && typ != "custom_tool_call" {
+				flushPendingToolCalls()
+			}
+
 			switch typ {
 			case "function_call_progress":
 				// Progress is deliberately not converted into an assistant/tool
@@ -74,13 +136,23 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 				if strings.TrimSpace(id) == "" {
 					return o, fmt.Errorf("function_call_output missing call_id")
 				}
-				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: strings.TrimSpace(id), Content: m["output"]})
+				id = strings.TrimSpace(id)
+				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: id, Content: flattenToolOutput(m["output"])})
+				delete(awaitingToolOutputs, id)
+				if len(awaitingToolOutputs) == 0 && len(deferredMsgs) > 0 {
+					flushDeferred()
+				}
 			case "custom_tool_call_output":
 				id, _ := m["call_id"].(string)
 				if strings.TrimSpace(id) == "" {
 					return o, fmt.Errorf("custom_tool_call_output missing call_id")
 				}
-				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: strings.TrimSpace(id), Content: m["output"]})
+				id = strings.TrimSpace(id)
+				o.Messages = append(o.Messages, oaiMsg{Role: "tool", ToolCallID: id, Content: flattenToolOutput(m["output"])})
+				delete(awaitingToolOutputs, id)
+				if len(awaitingToolOutputs) == 0 && len(deferredMsgs) > 0 {
+					flushDeferred()
+				}
 			case "function_call":
 				id, _ := m["call_id"].(string)
 				name, _ := m["name"].(string)
@@ -91,12 +163,14 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 						args = x
 					}
 				}
-				o.Messages = append(o.Messages, oaiMsg{Role: "assistant", ToolCalls: []map[string]any{{"id": id, "type": "function", "function": map[string]any{"name": name, "arguments": mustJSON(args)}}}})
+				pendingToolCalls = append(pendingToolCalls, map[string]any{"id": id, "type": "function", "function": map[string]any{"name": name, "arguments": mustJSON(args)}})
+				pendingToolCallIDs = append(pendingToolCallIDs, id)
 			case "custom_tool_call":
 				id, _ := m["call_id"].(string)
 				name, _ := m["name"].(string)
 				input, _ := m["input"].(string)
-				o.Messages = append(o.Messages, oaiMsg{Role: "assistant", ToolCalls: []map[string]any{{"id": id, "type": "custom", "function": map[string]any{"name": name, "arguments": mustJSON(map[string]any{"input": input})}}}})
+				pendingToolCalls = append(pendingToolCalls, map[string]any{"id": id, "type": "custom", "function": map[string]any{"name": name, "arguments": mustJSON(map[string]any{"input": input})}})
+				pendingToolCallIDs = append(pendingToolCallIDs, id)
 			default:
 				role, _ := m["role"].(string)
 				if role == "" {
@@ -109,9 +183,18 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 				if content == nil {
 					content = []any{m}
 				}
-				o.Messages = append(o.Messages, oaiMsg{Role: role, Content: content})
+				msg := oaiMsg{Role: role, Content: content}
+				// Defer messages that appear while we're still waiting for tool
+				// outputs to preserve assistant(tool_calls) -> tool(result) adjacency.
+				if hasAwaitingOutput() {
+					deferredMsgs = append(deferredMsgs, msg)
+				} else {
+					o.Messages = append(o.Messages, msg)
+				}
 			}
 		}
+		flushPendingToolCalls()
+		flushDeferred()
 	default:
 		return o, fmt.Errorf("input must be string or array")
 	}
@@ -151,6 +234,33 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 		o.Messages = append([]oaiMsg{{Role: "system", Content: customExecWorkspaceInstruction}}, o.Messages...)
 	}
 	return o, nil
+}
+
+// flattenToolOutput normalizes a tool output value that may be a plain
+// string, an array of content parts ({"type":"input_text","text":...}),
+// or a non-string scalar into a single text payload for a Chat Completions
+// tool message. Mirrors responsesToolOutputText from CLIProxyAPI.
+func flattenToolOutput(v any) any {
+	switch val := v.(type) {
+	case string:
+		return val
+	case []any:
+		var b strings.Builder
+		for _, part := range val {
+			if s, ok := part.(string); ok {
+				b.WriteString(s)
+				continue
+			}
+			if m, ok := part.(map[string]any); ok {
+				if text, ok := m["text"].(string); ok {
+					b.WriteString(text)
+				}
+			}
+		}
+		return b.String()
+	default:
+		return v
+	}
 }
 
 type anthropicMessage struct {

@@ -31,12 +31,14 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 			nameStr, _ := fn["name"].(string)
 			if tc["type"] == "custom" {
 				input := customToolInput(fn["arguments"])
-				output = append(output, map[string]any{"type": "custom_tool_call", "id": "ctc_" + uuid.NewString(), "call_id": callID, "name": nameStr, "input": input, "status": "completed"})
+				// id is derived from call_id so clients can correlate the two fields.
+				output = append(output, map[string]any{"type": "custom_tool_call", "id": "ctc_" + callID, "call_id": callID, "name": nameStr, "input": input, "status": "completed"})
 				log.Printf("[responses-output] type=custom_tool_call name=%s call_id=%s input_len=%d", nameStr, callID, len(input))
 				continue
 			}
 			args := ensureJSONString(fn["arguments"])
-			output = append(output, map[string]any{"type": "function_call", "id": "fc_" + uuid.NewString(), "call_id": callID, "name": nameStr, "arguments": args, "status": "completed"})
+			// id is derived from call_id so clients can correlate the two fields.
+			output = append(output, map[string]any{"type": "function_call", "id": "fc_" + callID, "call_id": callID, "name": nameStr, "arguments": args, "status": "completed"})
 			log.Printf("[responses-output] type=function_call name=%s call_id=%s args_len=%d", nameStr, callID, len(args))
 		}
 	} else {
