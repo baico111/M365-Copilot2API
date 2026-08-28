@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"m365-copilot2api/internal/chathub"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,35 +34,36 @@ func newConversationCache() *conversationCache {
 	}
 }
 
-func (c *conversationCache) key(accountID, model string) string {
-	return accountID + "|" + model
+func (c *conversationCache) key(sessionKey, accountID, model string) string {
+	return sessionKey + "|" + accountID + "|" + model
 }
 
-func (c *conversationCache) Lookup(accountID, model string) *cachedConversation {
+func (c *conversationCache) Lookup(sessionKey, accountID, model string) *cachedConversation {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry := c.entries[c.key(accountID, model)]
+	k := c.key(sessionKey, accountID, model)
+	entry := c.entries[k]
 	if entry == nil {
 		return nil
 	}
 	if time.Since(entry.LastUsedAt) > c.maxAge {
-		delete(c.entries, c.key(accountID, model))
+		delete(c.entries, k)
 		return nil
 	}
 	return entry
 }
 
-func (c *conversationCache) Store(accountID, model string, conv *cachedConversation) {
+func (c *conversationCache) Store(sessionKey, accountID, model string, conv *cachedConversation) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	conv.LastUsedAt = time.Now()
-	c.entries[c.key(accountID, model)] = conv
+	c.entries[c.key(sessionKey, accountID, model)] = conv
 }
 
-func (c *conversationCache) Invalidate(accountID, model string) {
+func (c *conversationCache) Invalidate(sessionKey, accountID, model string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.entries, c.key(accountID, model))
+	delete(c.entries, c.key(sessionKey, accountID, model))
 }
 
 func (c *conversationCache) GC() {
@@ -100,11 +103,11 @@ func extractLastUserMessage(messages []oaiMsg) string {
 	return ""
 }
 
-func (s *Server) storeConvCache(accID, model string, res chathub.Result, tone string, messages []oaiMsg, reused bool) {
+func (s *Server) storeConvCache(sessionKey, accID, model string, res chathub.Result, tone string, messages []oaiMsg, reused bool) {
 	if res.ConversationID == "" {
 		return
 	}
-	cached := s.convCache.Lookup(accID, model)
+	cached := s.convCache.Lookup(sessionKey, accID, model)
 	entry := &cachedConversation{
 		ConversationID: res.ConversationID,
 		SessionID:      res.SessionID,
@@ -117,9 +120,38 @@ func (s *Server) storeConvCache(accID, model string, res chathub.Result, tone st
 	} else {
 		entry.TurnCount = 1
 	}
-	s.convCache.Store(accID, model, entry)
+	s.convCache.Store(sessionKey, accID, model, entry)
 }
 
-func (s *Server) invalidateConvCache(accID, model string) {
-	s.convCache.Invalidate(accID, model)
+func (s *Server) invalidateConvCache(sessionKey, accID, model string) {
+	s.convCache.Invalidate(sessionKey, accID, model)
+}
+
+// convSessionKey derives a stable isolation key for the conversation cache.
+// It combines the caller's tenant (API-key hash) with a client dimension
+// (explicit session id > user field > IP+UA fingerprint) so that two
+// different clients hitting the same account+model never share the same
+// cached M365 conversation. This prevents cross-session context leakage
+// when multiple tools or users call the API concurrently.
+//
+// Priority: X-M365-Session-Id > body.User > IP+UA fingerprint.
+// The tenant (derived from the API key) is always prepended so that two
+// different API keys are isolated even if they present the same session id
+// or come from the same IP.
+func convSessionKey(r *http.Request, body *oaiReq) string {
+	tenant := tenantFromRequest(r)
+
+	// Explicit client session id is the strongest signal.
+	if explicit := strings.TrimSpace(r.Header.Get("X-M365-Session-Id")); explicit != "" {
+		return tenant + "|" + explicit
+	}
+
+	// The OpenAI "user" field is the next best signal.
+	if body != nil && strings.TrimSpace(body.User) != "" {
+		h := sha256.Sum256([]byte(body.User))
+		return tenant + "|u:" + hex.EncodeToString(h[:16])
+	}
+
+	// Fall back to IP+UA fingerprint for anonymous callers.
+	return tenant + "|" + clientIPFingerprint(r)
 }

@@ -502,7 +502,6 @@ func (h *accountHealth) ImageLimited(accountID string) bool {
 		if until, ok := h.imageLimitUntil[accountID]; ok && time.Now().After(until) {
 			delete(h.imageLimited, accountID)
 			delete(h.imageLimitUntil, accountID)
-			delete(h.imageLimitUntil, accountID)
 		}
 	}
 	h.cleanupExpiredCooldownLocked(accountID)

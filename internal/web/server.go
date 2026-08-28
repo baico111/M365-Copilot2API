@@ -1978,10 +1978,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// was provided by client, session key, user session, or session resolver.
 	convReused := false
 	convCacheModel := firstNonEmpty(body.Model, "m365-copilot")
+	convCacheSessionKey := convSessionKey(r, &body)
 	if body.ConversationID == "" && len(body.Messages) > 1 &&
 		(body.Metadata == nil || !body.Metadata.CopilotTempSession) {
 		sysHash := systemPromptHash(body.Messages)
-		if cached := s.convCache.Lookup(acc.ID, convCacheModel); cached != nil && cached.SystemPrompt == sysHash {
+		if cached := s.convCache.Lookup(convCacheSessionKey, acc.ID, convCacheModel); cached != nil && cached.SystemPrompt == sysHash {
 			if len(body.Messages) > cached.MessageCount {
 				incPrompt, incAtt := flattenPromptMessages(body.Messages[cached.MessageCount:], nil)
 				incPrompt = strings.TrimSpace(incPrompt)
@@ -1991,13 +1992,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 					answerPrompt = incPrompt
 					body.Attachments = incAtt
 					convReused = true
-					log.Printf("[conv-cache] hit account=%s model=%s conversation=%s cached_msgs=%d new_msgs=%d", acc.ID, convCacheModel, cached.ConversationID, cached.MessageCount, len(body.Messages))
+					log.Printf("[conv-cache] hit session=%s account=%s model=%s conversation=%s cached_msgs=%d new_msgs=%d", convCacheSessionKey, acc.ID, convCacheModel, cached.ConversationID, cached.MessageCount, len(body.Messages))
 				}
 			}
 		}
 	}
 	if !convReused && body.ConversationID == "" {
-		log.Printf("[conv-cache] miss account=%s model=%s", acc.ID, convCacheModel)
+		log.Printf("[conv-cache] miss session=%s account=%s model=%s", convCacheSessionKey, acc.ID, convCacheModel)
 	}
 
 	// Normalize tools once. Selection is always made by the upstream model;
@@ -2292,7 +2293,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
 			if convReused {
-				s.invalidateConvCache(acc.ID, convCacheModel)
+				s.invalidateConvCache(convCacheSessionKey, acc.ID, convCacheModel)
 			}
 			msg := upstreamError(err)
 			if IsRateLimited(err) {
@@ -2373,7 +2374,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
 			}
 			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
-			s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+			s.storeConvCache(convCacheSessionKey, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 			return
 		}
 		if err := emitText(pending.String()); err != nil {
@@ -2396,7 +2397,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
 		s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
-		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		s.storeConvCache(convCacheSessionKey, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 		return
 	}
 	// Ask the upstream model to select and validate the next tool. The gateway
@@ -2636,7 +2637,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
 			if convReused {
-				s.invalidateConvCache(acc.ID, convCacheModel)
+				s.invalidateConvCache(convCacheSessionKey, acc.ID, convCacheModel)
 			}
 			msg := upstreamError(err)
 			if IsRateLimited(err) {
@@ -2724,8 +2725,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			s.accountPool.MarkImageLimited(acc.ID)
 		}
 		if convReused {
-			s.invalidateConvCache(acc.ID, convCacheModel)
-			log.Printf("[conv-cache] invalidated account=%s model=%s after error: %v", acc.ID, convCacheModel, err)
+			s.invalidateConvCache(convCacheSessionKey, acc.ID, convCacheModel)
+			log.Printf("[conv-cache] invalidated session=%s account=%s model=%s after error: %v", convCacheSessionKey, acc.ID, convCacheModel, err)
 		}
 		writeUpstreamErrorWithAccount(w, err, acc.ID)
 		return
@@ -2740,7 +2741,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
 		s.bindConversation(acc, &body, r, res, prompt, startedAt)
-		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		s.storeConvCache(convCacheSessionKey, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 		return
 	}
 
@@ -2753,7 +2754,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	if res.ConversationID != "" {
 		s.bindConversation(acc, &body, r, res, prompt, startedAt)
-		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
+		s.storeConvCache(convCacheSessionKey, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 	}
 	if res.ConversationID != "" {
 		resolved := s.sessionResolver.Resolve(r, &body)
