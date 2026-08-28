@@ -794,8 +794,18 @@ func (s *Server) clearCooldown(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	// Body is optional; if no body or empty ID, clear all.
+	json.NewDecoder(r.Body).Decode(&body)
+	if body.ID != "" {
+		s.accountPool.ClearAccountCooldown(body.ID)
+		jsonOut(w, map[string]any{"status": "ok", "cleared": body.ID})
+		return
+	}
 	s.accountPool.ClearAllCooldowns()
-	jsonOut(w, map[string]any{"status": "ok"})
+	jsonOut(w, map[string]any{"status": "ok", "cleared": "all"})
 }
 
 // probeAccount tests one or all accounts by sending a lightweight chat request
@@ -1161,7 +1171,9 @@ func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 	if accountID == "" {
-		// Failover mode: prefer the last healthy account, only rotate on failure
+		// Failover mode: prefer the last healthy account, only rotate on failure.
+		// But only if it still has concurrency capacity — otherwise multiple
+		// concurrent requests would all pile onto the same account.
 		s.mu.Lock()
 		preferred := s.lastHealthyAccount
 		s.mu.Unlock()
@@ -1171,23 +1183,43 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 				return acc, nil
 			}
 		}
-		// No preferred account or it's unavailable; fall back to round-robin
-		acc, ok := s.tokens.Next()
-		if !ok {
-			return auth.AccountToken{}, fmt.Errorf("no accounts; login first")
-		}
-		accountID = acc.ID
-		for i := 0; !s.accountAvailable(accountID) && i < maxAccountProbe; i++ {
-			acc, ok = s.tokens.Next()
+		// No preferred account or it's unavailable/concurrency-full; fall back to round-robin
+		// Iterate through ALL accounts to find one that is healthy AND has concurrency capacity.
+		seen := make(map[string]bool)
+		var firstUnavailable string
+		for i := 0; i < 256; i++ {
+			acc, ok := s.tokens.Next()
 			if !ok {
 				break
 			}
+			if seen[acc.ID] {
+				break // wrapped around
+			}
+			seen[acc.ID] = true
 			accountID = acc.ID
+			if !s.tokens.ScheduleEnabled(accountID) {
+				continue
+			}
+			if !s.accountPool.Available(accountID) {
+				if firstUnavailable == "" {
+					firstUnavailable = accountID
+				}
+				continue
+			}
+			if !s.accountConcurrency.Available(accountID) {
+				continue // concurrency full, try next
+			}
+			// Found a healthy account with capacity
+			result, err := s.tokens.EnsureValid(accountID)
+			if err == nil {
+				s.mu.Lock()
+				s.lastHealthyAccount = accountID
+				s.mu.Unlock()
+				return result, nil
+			}
 		}
-		if !s.tokens.ScheduleEnabled(accountID) {
-			return auth.AccountToken{}, fmt.Errorf("no accounts enabled for scheduling")
-		}
-		if !s.accountPool.Available(accountID) {
+		// All accounts probed but none had capacity — check if any are at least healthy
+		if !s.accountPool.Available(firstUnavailable) && firstUnavailable != "" {
 			until := s.accountPool.EarliestRecovery()
 			retry := int(time.Until(until).Seconds())
 			if retry < 5 {
@@ -1195,9 +1227,7 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 			}
 			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are cooling down; try again later"}
 		}
-		if !s.accountConcurrency.Available(accountID) {
-			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: 1, Body: "all accounts are at their concurrency limit; try again shortly"}
-		}
+		return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: 1, Body: "all accounts are at their concurrency limit; try again shortly"}
 	}
 	result, err := s.tokens.EnsureValid(accountID)
 	if err == nil {

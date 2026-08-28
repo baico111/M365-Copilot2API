@@ -862,6 +862,26 @@ func (h *accountHealth) ClearAllCooldowns() {
 	ResetGlobalCircuit()
 }
 
+// ClearAccountCooldown clears all cooldown and failure state for a single
+// account, allowing an admin to force it back online immediately.
+func (h *accountHealth) ClearAccountCooldown(accountID string) {
+	if h == nil || accountID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.cooldown, accountID)
+	delete(h.authFail, accountID)
+	delete(h.limited, accountID)
+	delete(h.authFailReason, accountID)
+	delete(h.imageLimited, accountID)
+	delete(h.imageLimitUntil, accountID)
+	delete(h.imageGenCooldownUntil, accountID)
+	delete(h.imageGenSystemCooldown, accountID)
+	delete(h.quotaAttempts, accountID)
+	delete(h.calls, accountID)
+}
+
 func (h *accountHealth) EarliestRecovery() time.Time {
 	h.mu.Lock()
 	defer h.mu.Unlock()

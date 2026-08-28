@@ -1082,7 +1082,8 @@ function renderAccounts(){
     const scheduleEnabled=x.scheduleEnabled!==false;
     const proxyLabel=x.boundProxy?`<span style="font-size:11px;word-break:break-all">${esc(x.boundProxy)}</span>`:'<span style="color:var(--muted);font-size:11px">—</span>';
     const reason=x.authFailReason?`<span style="font-size:11px;color:var(--red)">${esc(x.authFailReason)}</span>`:(x.cooldownUntil?'<span style="font-size:11px;color:#d97706">cooldown</span>':'<span style="color:var(--muted);font-size:11px">—</span>');
-    return `<tr><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div></div></div></td><td style="font-size:12px;white-space:nowrap">${calls}</td><td>${status}</td><td>${reason}</td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><button class="btn-sm btn${scheduleEnabled?'':' danger'}" onclick="toggleAccountSchedule('${x.id}',${!scheduleEnabled})">${scheduleEnabled?'Enabled':'Disabled'}</button></td><td>${proxyLabel} <button class="btn-sm btn" style="margin-top:2px" onclick="bindAccountProxy('${x.id}','${esc(x.boundProxy||'')}')">Bind</button></td><td style="white-space:nowrap"><button class="btn-sm btn" onclick="probeOneAccount('${x.id}')" style="margin-right:4px">Probe</button><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></td></tr>`;
+    const forceOnline=(x.status==='cooldown'||x.status==='offline'||x.authFailReason)?`<button class="btn-sm btn success" onclick="forceOnlineAccount('${x.id}')" style="margin-right:4px">Online</button>`:'';
+    return `<tr><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div></div></div></td><td style="font-size:12px;white-space:nowrap">${calls}</td><td>${status}</td><td>${reason}</td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><button class="btn-sm btn${scheduleEnabled?'':' danger'}" onclick="toggleAccountSchedule('${x.id}',${!scheduleEnabled})">${scheduleEnabled?'Enabled':'Disabled'}</button></td><td>${proxyLabel} <button class="btn-sm btn" style="margin-top:2px" onclick="bindAccountProxy('${x.id}','${esc(x.boundProxy||'')}')">Bind</button></td><td style="white-space:nowrap">${forceOnline}<button class="btn-sm btn" onclick="probeOneAccount('${x.id}')" style="margin-right:4px">Probe</button><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></td></tr>`;
   }).join(''):'<tr><td colspan="8" class="empty">No matching accounts</td></tr>';
 }
 async function loadAccounts(){
@@ -1125,6 +1126,14 @@ async function probeOneAccount(id){
       const reason=r.errorReason||r.errorCategory||'unknown';
       showNotice(`❌ ${r.email||r.id} offline: ${reason}`,'error');
     }
+    loadAccounts();
+  }catch(e){showNotice(e.message,'error');}
+}
+
+async function forceOnlineAccount(id){
+  try{
+    await api('/api/accounts/clear-cooldown',{method:'POST',body:JSON.stringify({id})});
+    showNotice('Account forced online','success');
     loadAccounts();
   }catch(e){showNotice(e.message,'error');}
 }
