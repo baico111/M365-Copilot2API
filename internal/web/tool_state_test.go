@@ -59,3 +59,36 @@ func TestValidateToolConversationAllResolved(t *testing.T) {
 		t.Fatalf("expected pass, got: %v", err)
 	}
 }
+
+func TestValidateAndRepairOrphanedToolResult(t *testing.T) {
+	// Simulates a cross-turn history where the function_call_output is present
+	// but the originating function_call (assistant tool_calls) is missing.
+	msgs := []oaiMsg{
+		{Role: "user", Content: "do stuff"},
+		{Role: "tool", ToolCallID: "call_orphan", Content: "result"},
+		{Role: "user", Content: "next"},
+	}
+	// validateToolConversation should reject this.
+	if err := validateToolConversation(msgs); err == nil {
+		t.Fatal("expected error from validateToolConversation")
+	}
+	// validateAndRepairToolConversation should fix it by inserting a synthetic assistant message.
+	repaired, err := validateAndRepairToolConversation(msgs)
+	if err != nil {
+		t.Fatalf("expected repair to succeed, got: %v", err)
+	}
+	if len(repaired) != len(msgs)+1 {
+		t.Fatalf("expected %d messages after repair, got %d", len(msgs)+1, len(repaired))
+	}
+	// The inserted message should be an assistant with the matching tool call.
+	if repaired[1].Role != "assistant" || len(repaired[1].ToolCalls) != 1 {
+		t.Fatalf("expected assistant tool_calls at index 1, got %+v", repaired[1])
+	}
+	if id, _ := repaired[1].ToolCalls[0]["id"].(string); id != "call_orphan" {
+		t.Fatalf("expected tool call id call_orphan, got %v", repaired[1].ToolCalls[0]["id"])
+	}
+	// Re-validation should pass.
+	if err := validateToolConversation(repaired); err != nil {
+		t.Fatalf("re-validation failed: %v", err)
+	}
+}

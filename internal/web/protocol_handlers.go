@@ -343,6 +343,18 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		writeResponsesError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
+	// Repair orphaned tool results (e.g. function_call_output from a previous
+	// response whose function_call is no longer in the input array) before the
+	// message reaches the upstream backend which requires strict adjacency.
+	repaired, repairErr := validateAndRepairToolConversation(o.Messages)
+	if repairErr != nil {
+		writeResponsesError(w, 400, "tool_protocol_error", repairErr.Error())
+		return
+	}
+	if len(repaired) != len(o.Messages) {
+		log.Printf("[responses] tool_conversation_repaired messages=%d->%d", len(o.Messages), len(repaired))
+	}
+	o.Messages = repaired
 	// Dual isolation: tenant\x00session so two keys never share history and
 	// within one tenant two explicit sessions (X-M365-Session-Id) cannot
 	// cross-read. Falls back to 8-char prefix display only for legacy callers
