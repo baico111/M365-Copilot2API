@@ -39,6 +39,7 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 				args := ensureJSONString(fn["arguments"])
 			if nameStr == "" {
 				log.Printf("[responses-output] WARNING: function.name is empty! tc=%+v fn=%+v", tc, fn)
+				nameStr = "unknown"
 			}
 			// id is derived from call_id so clients can correlate the two fields.
 			output = append(output, map[string]any{"type": "function_call", "id": "fc_" + callID, "call_id": callID, "name": nameStr, "arguments": args, "status": "completed"})
