@@ -32,6 +32,9 @@ func TestValidateToolConversationConsecutiveAssistant(t *testing.T) {
 
 func TestValidateToolConversationMissingResult(t *testing.T) {
 	// Last assistant has tool_calls but no matching tool results.
+	// This is now tolerated: the Responses API allows function_call items
+	// without corresponding function_call_output when the output was
+	// delivered in a prior turn.
 	msgs := []oaiMsg{
 		{Role: "user", Content: "do stuff"},
 		{Role: "assistant", ToolCalls: []map[string]any{{"id": "A", "type": "function", "function": map[string]any{"name": "f", "arguments": "{}"}}}},
@@ -39,8 +42,20 @@ func TestValidateToolConversationMissingResult(t *testing.T) {
 		// B has no tool result
 		{Role: "tool", ToolCallID: "A", Content: "result A"},
 	}
-	if err := validateToolConversation(msgs); err == nil {
-		t.Fatal("expected error for missing tool result B")
+	if err := validateToolConversation(msgs); err != nil {
+		t.Fatalf("expected tolerance for missing tool result B, got: %v", err)
+	}
+	// validateAndRepairToolConversation should auto-complete the missing result.
+	repaired, err := validateAndRepairToolConversation(msgs)
+	if err != nil {
+		t.Fatalf("expected auto-complete to succeed, got: %v", err)
+	}
+	if len(repaired) != len(msgs)+1 {
+		t.Fatalf("expected %d messages after auto-complete, got %d", len(msgs)+1, len(repaired))
+	}
+	last := repaired[len(repaired)-1]
+	if last.Role != "tool" || last.ToolCallID != "B" {
+		t.Fatalf("expected auto-completed tool result for B, got %+v", last)
 	}
 }
 

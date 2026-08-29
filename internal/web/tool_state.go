@@ -19,6 +19,11 @@ import (
 // longer in the message array. Without the repair the upstream backend
 // (M365 Copilot ChatHub) would reject the request because it requires
 // every tool message to be preceded by a matching assistant tool call.
+//
+// Assistant tool calls whose results are missing are tolerated: the Responses
+// API allows a function_call to appear in input without a corresponding
+// function_call_output when the output was delivered in a prior turn that
+// the client does not replay.
 func validateToolConversation(messages []oaiMsg) error {
 	if len(messages) > 0 {
 		first := messages[0].Role
@@ -28,15 +33,9 @@ func validateToolConversation(messages []oaiMsg) error {
 	}
 	pending := map[string]bool{}
 	completed := map[string]bool{}
-	// Track unresolved assistant indices for diagnostics.
-	unresolvedAssistantIdx := []int{}
 	for i, m := range messages {
 		switch m.Role {
 		case "assistant":
-			// Record unresolved calls from previous assistant turns.
-			if len(pending) > 0 {
-				unresolvedAssistantIdx = append(unresolvedAssistantIdx, i)
-			}
 			for _, call := range m.ToolCalls {
 				id, _ := call["id"].(string)
 				if id == "" {
@@ -58,11 +57,7 @@ func validateToolConversation(messages []oaiMsg) error {
 			completed[m.ToolCallID] = true
 		}
 	}
-	if len(pending) > 0 {
-		for id := range pending {
-			return fmt.Errorf("missing tool result for tool_call_id: %s (unresolved assistant turns at indices: %v)", id, unresolvedAssistantIdx)
-		}
-	}
+	// Pending tool calls without results are tolerated — see comment above.
 	return nil
 }
 
@@ -117,6 +112,38 @@ func repairOrphanedToolResults(messages []oaiMsg) ([]oaiMsg, int) {
 	return out, inserted
 }
 
+// completeMissingToolResults scans for assistant tool_calls that have no
+// corresponding tool message and appends synthetic tool results for each.
+// This is required by strict backends (M365 Copilot ChatHub) that expect
+// every tool_call to be followed by a tool result in the same conversation.
+func completeMissingToolResults(messages []oaiMsg) ([]oaiMsg, int) {
+	pending := map[string]bool{}
+	for _, m := range messages {
+		switch m.Role {
+		case "assistant":
+			for _, call := range m.ToolCalls {
+				if id, _ := call["id"].(string); id != "" {
+					pending[id] = true
+				}
+			}
+		case "tool":
+			delete(pending, m.ToolCallID)
+		}
+	}
+	if len(pending) == 0 {
+		return messages, 0
+	}
+	out := make([]oaiMsg, 0, len(messages)+len(pending))
+	out = append(out, messages...)
+	added := 0
+	for id := range pending {
+		out = append(out, oaiMsg{Role: "tool", ToolCallID: id, Content: "[result from previous turn]"})
+		added++
+		log.Printf("[tool-repair] appended synthetic tool result for unresolved call_id=%s", id)
+	}
+	return out, added
+}
+
 // validateAndRepairToolConversation runs validateToolConversation on the
 // messages; if it fails with "unexpected tool result", it repairs the
 // orphaned tool messages and re-validates. Returns the (possibly repaired)
@@ -132,11 +159,26 @@ func validateAndRepairToolConversation(messages []oaiMsg) ([]oaiMsg, error) {
 		if inserted > 0 {
 			log.Printf("[tool-repair] repaired %d orphaned tool messages, re-validating", inserted)
 			if err2 := validateToolConversation(repaired); err2 != nil {
+				log.Printf("[tool-repair] re-validation FAILED after repair: %s", err2.Error())
+				for i, m := range repaired {
+					toolCallIDs := []string{}
+					for _, tc := range m.ToolCalls {
+						id, _ := tc["id"].(string)
+						toolCallIDs = append(toolCallIDs, id)
+					}
+					log.Printf("[tool-repair] msg[%d] role=%s tool_call_id=%q tool_calls=%v content_len=%d", i, m.Role, m.ToolCallID, toolCallIDs, len(fmt.Sprint(m.Content)))
+				}
 				return repaired, err2
 			}
 			return repaired, nil
 		}
 		return messages, err
 	}
-	return messages, nil
+	// Even when validation passes, complete any missing tool results so
+	// the upstream backend (ChatHub) doesn't reject the conversation.
+	completed, added := completeMissingToolResults(messages)
+	if added > 0 {
+		log.Printf("[tool-repair] completed %d missing tool results", added)
+	}
+	return completed, nil
 }

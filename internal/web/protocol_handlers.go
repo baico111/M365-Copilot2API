@@ -362,6 +362,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	// message reaches the upstream backend which requires strict adjacency.
 	repaired, repairErr := validateAndRepairToolConversation(o.Messages)
 	if repairErr != nil {
+		log.Printf("[responses] tool_protocol_error: %s messages=%d", repairErr.Error(), len(o.Messages))
 		writeResponsesError(w, 400, "tool_protocol_error", repairErr.Error())
 		return
 	}
