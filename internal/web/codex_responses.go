@@ -36,7 +36,10 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 				log.Printf("[responses-output] type=custom_tool_call name=%s call_id=%s input_len=%d", nameStr, callID, len(input))
 				continue
 			}
-			args := ensureJSONString(fn["arguments"])
+				args := ensureJSONString(fn["arguments"])
+			if nameStr == "" {
+				log.Printf("[responses-output] WARNING: function.name is empty! tc=%+v fn=%+v", tc, fn)
+			}
 			// id is derived from call_id so clients can correlate the two fields.
 			output = append(output, map[string]any{"type": "function_call", "id": "fc_" + callID, "call_id": callID, "name": nameStr, "arguments": args, "status": "completed"})
 			log.Printf("[responses-output] type=function_call name=%s call_id=%s args_len=%d", nameStr, callID, len(args))
@@ -58,6 +61,9 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 	}
 	resp := map[string]any{"id": id, "object": "response", "created_at": time.Now().Unix(), "status": "completed", "model": model, "output": output, "usage": usage, "m365": localUsageMetadata(usageSource)}
 	if !stream {
+		if respBody, err := json.Marshal(resp); err == nil {
+			log.Printf("[responses-output] non_stream_response body=%s", string(respBody))
+		}
 		jsonOut(w, resp)
 		return
 	}
