@@ -111,6 +111,15 @@ func (s *Server) accountClient(accountID string) *chathub.Client {
 	// by hashing the account ID. This ensures each account always uses
 	// the same exit IP (sticky per account) while different accounts get
 	// different IPs.
+	//
+	// NOTE: We intentionally do NOT use a connection pool when routing
+	// through sing-box SOCKS5 proxies. SOCKS5 proxies (especially
+	// sing-box's VLESS/VMess tunnels) may silently drop idle WebSocket
+	// connections, and a pooled connection that looks alive can fail
+	// mid-stream — truncating SignalR frames so tool call chunks are
+	// lost, producing empty call_id / id fields and triggering
+	// "Expected 'id' to be a string" errors on Codex/OpenCode clients.
+	// A fresh dial per request avoids this entire class of bugs.
 	if n := outbound.SingBoxNodeCount(); n > 0 {
 		nodeIdx := int(stableHash(accountID) % uint64(n))
 		clients := outbound.SingBoxNodeClient(nodeIdx)
@@ -118,7 +127,7 @@ func (s *Server) accountClient(accountID string) *chathub.Client {
 			HTTPHeader: s.chat.HTTPHeader,
 			HTTPClient: clients.HTTP,
 			Dialer:     clients.WebSocket,
-			Pool:       chathub.NewConnPool(clients.WebSocket, s.chat.HTTPHeader),
+			Pool:       nil, // no pool when using SOCKS5 proxy
 			Trace:      s.chat.Trace,
 		}
 	}

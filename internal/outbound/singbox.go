@@ -257,7 +257,10 @@ func buildLocalSOCKS5Clients(port int) *Clients {
 	c := directClients()
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	auth := &proxy.Auth{}
-	d, err := proxy.SOCKS5("tcp", socksAddr, auth, proxy.Direct)
+	// Use a forward dialer with a generous timeout so that when sing-box
+	// is unreachable the SOCKS5 handshake does not hang indefinitely.
+	forward := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	d, err := proxy.SOCKS5("tcp", socksAddr, auth, forward)
 	if err != nil {
 		log.Printf("[sing-box] SOCKS5 dialer creation failed, using direct: %v", err)
 		return c

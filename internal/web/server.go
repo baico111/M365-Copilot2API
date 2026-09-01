@@ -176,8 +176,11 @@ func (s *Server) clientForProxy(proxyURL string) *chathub.Client {
 		HTTPHeader: make(http.Header),
 		HTTPClient: clients.HTTP,
 		Dialer:     clients.WebSocket,
-		Pool:       chathub.NewConnPool(clients.WebSocket, make(http.Header)),
-		Trace:      s.chat.Trace,
+		// No connection pool for explicitly bound proxies: SOCKS5/HTTP
+		// proxies may silently drop idle WebSocket connections, causing
+		// mid-stream truncation and empty tool call IDs.
+		Pool:  nil,
+		Trace: s.chat.Trace,
 	}
 	c.HTTPHeader.Set("Origin", "https://m365.cloud.microsoft")
 	c.HTTPHeader.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0")
