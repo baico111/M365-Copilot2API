@@ -1,0 +1,581 @@
+package outbound
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/net/proxy"
+)
+
+// SingBoxConfig holds the subscription URL and runtime state.
+type SingBoxConfig struct {
+	SubscriptionURL string
+	BinaryPath      string
+	ConfigDir       string
+	LocalPort       int
+}
+
+const (
+	envSubscription = "M365_SINGBOX_SUBSCRIPTION"
+	envBinaryPath    = "M365_SINGBOX_BINARY"
+	envConfigDir     = "M365_SINGBOX_CONFIG_DIR"
+	envLocalPort     = "M365_SINGBOX_LOCAL_PORT"
+	defaultLocalPort = 11080
+	defaultBinary    = "sing-box"
+)
+
+var (
+	sbMu       sync.Mutex
+	sbConfig   *SingBoxConfig
+	sbProcess  *exec.Cmd
+	sbClients  *Clients // clients pointed at the local sing-box SOCKS5
+	sbNodeList []string // node names for status reporting
+)
+
+func defaultSingBoxConfig() *SingBoxConfig {
+	port := defaultLocalPort
+	if p := os.Getenv(envLocalPort); p != "" {
+		if n, err := fmt.Sscanf(p, "%d", &port); n == 1 && err == nil && port > 0 && port < 65536 {
+			// ok
+		}
+	}
+	dir := "/tmp/sing-box-config"
+	if d := os.Getenv(envConfigDir); d != "" {
+		dir = d
+	}
+	bin := defaultBinary
+	if b := os.Getenv(envBinaryPath); b != "" {
+		bin = b
+	}
+	return &SingBoxConfig{
+		SubscriptionURL: strings.TrimSpace(os.Getenv(envSubscription)),
+		BinaryPath:      bin,
+		ConfigDir:       dir,
+		LocalPort:       port,
+	}
+}
+
+// ConfigureSingBox fetches the subscription, parses nodes, generates a
+// sing-box config, starts sing-box, and wires HTTPClient/WebSocketDialer
+// to the local SOCKS5 port.
+func ConfigureSingBox(subscriptionURL string) error {
+	cfg := defaultSingBoxConfig()
+	cfg.SubscriptionURL = subscriptionURL
+
+	nodes, err := fetchSubscription(subscriptionURL)
+	if err != nil {
+		return fmt.Errorf("sing-box: fetch subscription: %w", err)
+	}
+	if len(nodes) == 0 {
+		return fmt.Errorf("sing-box: subscription returned 0 nodes")
+	}
+
+	if err := writeSingBoxConfig(cfg, nodes); err != nil {
+		return fmt.Errorf("sing-box: write config: %w", err)
+	}
+
+	// Stop existing process
+	stopSingBox()
+
+	// Start sing-box
+	cmd := exec.Command(cfg.BinaryPath, "run", "-c", filepath.Join(cfg.ConfigDir, "config.json"))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		// Try "run -c" fallback to just the config path
+		cmd2 := exec.Command(cfg.BinaryPath, "run", filepath.Join(cfg.ConfigDir, "config.json"))
+		cmd2.Stdout = os.Stdout
+		cmd2.Stderr = os.Stderr
+		if err2 := cmd2.Start(); err2 != nil {
+			return fmt.Errorf("sing-box: failed to start binary %q: %w (also tried without -c: %v)", cfg.BinaryPath, err, err2)
+		}
+		cmd = cmd2
+	}
+
+	sbMu.Lock()
+	sbConfig = cfg
+	sbProcess = cmd
+	sbNodeList = nodeNames(nodes)
+	// Build clients pointing at the local SOCKS5
+	sbClients = buildLocalSOCKS5Clients(cfg.LocalPort)
+	sbMu.Unlock()
+
+	log.Printf("[sing-box] started with %d nodes on port %d", len(nodes), cfg.LocalPort)
+
+	// Wait for sing-box in background; restart on exit
+	go func() {
+		err := cmd.Wait()
+		log.Printf("[sing-box] process exited: %v", err)
+		sbMu.Lock()
+		sbProcess = nil
+		sbMu.Unlock()
+	}()
+
+	// Start auto-refresh goroutine
+	go refreshLoop(cfg)
+
+	return nil
+}
+
+func StopSingBox() {
+	stopSingBox()
+}
+
+func stopSingBox() {
+	sbMu.Lock()
+	defer sbMu.Unlock()
+	if sbProcess != nil && sbProcess.Process != nil {
+		_ = sbProcess.Process.Signal(os.Interrupt)
+		_ = sbProcess.Process.Kill()
+	}
+	sbProcess = nil
+}
+
+func refreshLoop(cfg *SingBoxConfig) {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		nodes, err := fetchSubscription(cfg.SubscriptionURL)
+		if err != nil {
+			log.Printf("[sing-box] refresh failed: %v", err)
+			continue
+		}
+		if len(nodes) == 0 {
+			continue
+		}
+		if err := writeSingBoxConfig(cfg, nodes); err != nil {
+			log.Printf("[sing-box] refresh write config failed: %v", err)
+			continue
+		}
+		// Reload sing-box
+		reloadCmd := exec.Command(cfg.BinaryPath, "run", "-c", filepath.Join(cfg.ConfigDir, "config.json"))
+		reloadCmd.Stdout = os.Stdout
+		reloadCmd.Stderr = os.Stderr
+		sbMu.Lock()
+		// Stop old process
+		if sbProcess != nil && sbProcess.Process != nil {
+			_ = sbProcess.Process.Signal(os.Interrupt)
+		}
+		if err := reloadCmd.Start(); err != nil {
+			log.Printf("[sing-box] reload failed: %v", err)
+			sbMu.Unlock()
+			continue
+		}
+		sbProcess = reloadCmd
+		sbNodeList = nodeNames(nodes)
+		sbMu.Unlock()
+		log.Printf("[sing-box] refreshed with %d nodes", len(nodes))
+		go func(c *exec.Cmd) {
+			err := c.Wait()
+			log.Printf("[sing-box] reloaded process exited: %v", err)
+		}(reloadCmd)
+	}
+}
+
+// buildLocalSOCKS5Clients creates Clients that route through a local SOCKS5 proxy.
+func buildLocalSOCKS5Clients(port int) *Clients {
+	c := directClients()
+	socksAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	auth := &proxy.Auth{}
+	d, err := proxy.SOCKS5("tcp", socksAddr, auth, proxy.Direct)
+	if err != nil {
+		log.Printf("[sing-box] SOCKS5 dialer creation failed, using direct: %v", err)
+		return c
+	}
+	x := socksContextDialer{dialer: d}
+	c.HTTP.Transport.(*http.Transport).DialContext = x.DialContext
+	c.WebSocket.NetDialContext = x.DialContext
+	return c
+}
+
+// ---- Subscription parsing ----
+
+type vlessNode struct {
+	UUID     string
+	Address  string
+	Port     int
+	Network  string // ws, tcp, etc.
+	TLS      bool
+	SNI      string
+	Host     string
+	Path     string
+	FP       string
+	Alpn     string
+	Name     string
+	Raw      string
+}
+
+func fetchSubscription(rawURL string) ([]vlessNode, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, _ := http.NewRequest("GET", rawURL, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return parseSubscriptionBody(string(body))
+}
+
+func parseSubscriptionBody(body string) ([]vlessNode, error) {
+	body = strings.TrimSpace(body)
+	// Try base64 decode first (common for subscription endpoints)
+	if decoded, err := base64.StdEncoding.DecodeString(body); err == nil {
+		body = string(decoded)
+	}
+	// Also try URL-safe base64
+	if decoded, err := base64.URLEncoding.DecodeString(body); err == nil {
+		body = string(decoded)
+	}
+
+	var nodes []vlessNode
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "vless://") {
+			node, err := parseVLESS(line)
+			if err != nil {
+				log.Printf("[sing-box] skip node: %v", err)
+				continue
+			}
+			nodes = append(nodes, node)
+		} else if strings.HasPrefix(line, "vmess://") {
+			node, err := parseVMess(line)
+			if err != nil {
+				log.Printf("[sing-box] skip vmess node: %v", err)
+				continue
+			}
+			nodes = append(nodes, node)
+		} else if strings.HasPrefix(line, "ss://") {
+			node, err := parseSS(line)
+			if err != nil {
+				log.Printf("[sing-box] skip ss node: %v", err)
+				continue
+			}
+			nodes = append(nodes, node)
+		}
+	}
+	return nodes, nil
+}
+
+func parseVLESS(raw string) (vlessNode, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return vlessNode{}, err
+	}
+	port, _ := strconvAtoi(u.Port())
+	if port == 0 {
+		port = 443
+	}
+	node := vlessNode{
+		UUID:    u.User.Username(),
+		Address: u.Hostname(),
+		Port:    port,
+		Network: "ws",
+		TLS:     true,
+		Name:    u.Fragment,
+		Raw:     raw,
+	}
+	q := u.Query()
+	if t := q.Get("type"); t != "" {
+		node.Network = t
+	}
+	if s := q.Get("security"); s == "tls" || s == "" {
+		node.TLS = true
+	} else if s == "none" {
+		node.TLS = false
+	}
+	node.SNI = q.Get("sni")
+	node.Host = q.Get("host")
+	node.Path = q.Get("path")
+	node.FP = q.Get("fp")
+	node.Alpn = q.Get("alpn")
+	if node.Path == "" {
+		node.Path = "/"
+	}
+	return node, nil
+}
+
+func parseVMess(raw string) (vlessNode, error) {
+	// vmess://base64(json)
+	encoded := strings.TrimPrefix(raw, "vmess://")
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		decoded, err = base64.URLEncoding.DecodeString(encoded)
+		if err != nil {
+			return vlessNode{}, fmt.Errorf("vmess base64 decode: %w", err)
+		}
+	}
+	var v struct {
+		Add  string `json:"add"`
+		Port any    `json:"port"`
+		ID   string `json:"id"`
+		Net  string `json:"net"`
+		Host string `json:"host"`
+		Path string `json:"path"`
+		TLS  string `json:"tls"`
+		SNI  string `json:"sni"`
+		V    any    `json:"v"`
+		PS   string `json:"ps"`
+	}
+	if err := json.Unmarshal(decoded, &v); err != nil {
+		return vlessNode{}, fmt.Errorf("vmess json decode: %w", err)
+	}
+	port := 443
+	switch p := v.Port.(type) {
+	case float64:
+		port = int(p)
+	case string:
+		port, _ = strconvAtoi(p)
+	}
+	network := v.Net
+	if network == "" {
+		network = "ws"
+	}
+	return vlessNode{
+		UUID:    v.ID,
+		Address: v.Add,
+		Port:    port,
+		Network: network,
+		TLS:     v.TLS == "tls",
+		SNI:     v.SNI,
+		Host:    v.Host,
+		Path:    v.Path,
+		Name:    v.PS,
+		Raw:     raw,
+	}, nil
+}
+
+func parseSS(raw string) (vlessNode, error) {
+	// ss://base64(method:password)@host:port#name
+	// or ss://base64(method:password@host:port)#name
+	u, err := url.Parse(raw)
+	if err != nil {
+		return vlessNode{}, err
+	}
+	port, _ := strconvAtoi(u.Port())
+	if port == 0 {
+		port = 443
+	}
+	return vlessNode{
+		Address: u.Hostname(),
+		Port:    port,
+		Network: "tcp",
+		TLS:     false,
+		Name:    u.Fragment,
+		Raw:     raw,
+	}, nil
+}
+
+func nodeNames(nodes []vlessNode) []string {
+	out := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		name := n.Name
+		if name == "" {
+			name = fmt.Sprintf("%s:%d", n.Address, n.Port)
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// ---- sing-box config generation ----
+
+func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) error {
+	if err := os.MkdirAll(cfg.ConfigDir, 0o755); err != nil {
+		return err
+	}
+
+	// Pick a random subset of nodes (up to 50) to rotate through
+	selected := selectRandomNodes(nodes, 50)
+
+	type outbound struct {
+		Tag   string `json:"tag"`
+		Type  string `json:"type"`
+		Server string `json:"server"`
+		ServerPort int `json:"server_port"`
+		UUID  string `json:"uuid,omitempty"`
+		Network string `json:"network,omitempty"`
+		TLS   *struct {
+			Enabled    bool   `json:"enabled"`
+			ServerName string `json:"server_name,omitempty"`
+		} `json:"tls,omitempty"`
+		WS *struct {
+			Path string `json:"path"`
+			Host string `json:"host,omitempty"`
+		} `json:"ws,omitempty"`
+	}
+
+	var outbounds []map[string]any
+
+	// selector outbound that randomly picks from nodes
+	var nodeTags []string
+	for i, n := range selected {
+		tag := fmt.Sprintf("node-%d", i)
+		nodeTags = append(nodeTags, tag)
+
+		ob := map[string]any{
+			"tag":          tag,
+			"type":         "vless",
+			"server":       n.Address,
+			"server_port":  n.Port,
+			"uuid":         n.UUID,
+			"network":      n.Network,
+		}
+		if n.TLS {
+			tlsConf := map[string]any{
+				"enabled":    true,
+				"server_name": n.SNI,
+			}
+			if n.FP != "" {
+				tlsConf["utls"] = map[string]any{
+					"enabled":     true,
+					"fingerprint": n.FP,
+				}
+			}
+			ob["tls"] = tlsConf
+		}
+		if n.Network == "ws" {
+			wsConf := map[string]any{
+				"path": n.Path,
+			}
+			if n.Host != "" {
+				wsConf["host"] = n.Host
+			}
+			ob["ws"] = wsConf
+		}
+		outbounds = append(outbounds, ob)
+	}
+
+	// selector with random strategy
+	selectorOut := map[string]any{
+		"tag":      "proxy",
+		"type":     "selector",
+		"outbounds": nodeTags,
+		"default":  nodeTags[0],
+	}
+	outbounds = append(outbounds, selectorOut)
+
+	// direct + block
+	outbounds = append(outbounds, map[string]any{"tag": "direct", "type": "direct"})
+	outbounds = append(outbounds, map[string]any{"tag": "block", "type": "block"})
+
+	// inbound: mixed (socks5 + http) on local port
+	inbound := map[string]any{
+		"tag":  "mixed-in",
+		"type": "mixed",
+		"listen": "127.0.0.1",
+		"listen_port": cfg.LocalPort,
+	}
+
+	// route
+	route := map[string]any{
+		"outbounds": map[string]any{
+			"default": "proxy",
+		},
+	}
+
+	config := map[string]any{
+		"log": map[string]any{
+			"level": "warn",
+		},
+		"inbounds":  []any{inbound},
+		"outbounds": outbounds,
+		"route":     route,
+	}
+
+	configPath := filepath.Join(cfg.ConfigDir, "config.json")
+	b, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configPath, b, 0o644)
+}
+
+func selectRandomNodes(nodes []vlessNode, max int) []vlessNode {
+	if len(nodes) <= max {
+		// Shuffle for random ordering
+		shuffled := make([]vlessNode, len(nodes))
+		copy(shuffled, nodes)
+		rand.Shuffle(len(shuffled), func(i, j int) {
+			shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+		})
+		return shuffled
+	}
+	// Random subset
+	selected := make([]vlessNode, 0, max)
+	indices := rand.Perm(len(nodes))
+	for i := 0; i < max; i++ {
+		selected = append(selected, nodes[indices[i]])
+	}
+	return selected
+}
+
+// ---- Public API (replaces old proxy pool) ----
+
+// SingBoxStatus returns info about the running sing-box instance.
+func SingBoxStatus() []map[string]any {
+	sbMu.Lock()
+	defer sbMu.Unlock()
+	if sbConfig == nil {
+		return []map[string]any{}
+	}
+	status := []map[string]any{
+		{
+			"subscription": sbConfig.SubscriptionURL,
+			"local_port":   sbConfig.LocalPort,
+			"binary":       sbConfig.BinaryPath,
+			"node_count":   len(sbNodeList),
+			"nodes":        sbNodeList,
+		},
+	}
+	return status
+}
+
+// SingBoxRunning reports whether sing-box is currently active.
+func SingBoxRunning() bool {
+	sbMu.Lock()
+	defer sbMu.Unlock()
+	return sbProcess != nil
+}
+
+// OverrideClients replaces the global clients (used by ConfigureSingBox
+// and for testing).
+func OverrideClients(c *Clients) {
+	clientsMu.Lock()
+	clients = c
+	clientsMu.Unlock()
+}
+
+// strconvAtoi is a local helper to avoid importing strconv.
+func strconvAtoi(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty")
+	}
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("not a number: %s", s)
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, nil
+}

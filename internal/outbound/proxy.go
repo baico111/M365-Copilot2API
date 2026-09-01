@@ -56,10 +56,17 @@ func directClients() *Clients {
 	}
 }
 func ConfigureFromEnv() error {
+	// Priority 1: sing-box subscription
+	subURL := strings.TrimSpace(os.Getenv(envSubscription))
+	if subURL != "" {
+		return ConfigureSingBox(subURL)
+	}
+	// Priority 2: old proxy pool (backward compat)
 	raw := strings.TrimSpace(os.Getenv("M365_PROXY_POOL"))
 	if raw != "" {
 		return ConfigurePool(strings.FieldsFunc(raw, func(r rune) bool { return r == '\n' || r == '\r' || r == ',' }))
 	}
+	// Priority 3: single proxy URL
 	return Configure(os.Getenv(EnvProxy))
 }
 func Configure(raw string) error {
@@ -87,6 +94,13 @@ func ConfigurePool(raw []string) error {
 func CurrentPool() *Pool { clientsMu.RLock(); defer clientsMu.RUnlock(); return proxyPool }
 
 func ProxyPoolStatus() []map[string]any {
+	// Priority: sing-box status
+	sbMu.Lock()
+	sb := sbConfig
+	sbMu.Unlock()
+	if sb != nil {
+		return SingBoxStatus()
+	}
 	clientsMu.RLock()
 	p := proxyPool
 	clientsMu.RUnlock()
@@ -138,6 +152,13 @@ func RemoveProxy(raw string) error {
 	return ConfigurePool(items)
 }
 func HTTPClient() *http.Client {
+	// Priority: sing-box clients
+	sbMu.Lock()
+	sbC := sbClients
+	sbMu.Unlock()
+	if sbC != nil {
+		return sbC.HTTP
+	}
 	clientsMu.RLock()
 	p, c := proxyPool, clients.HTTP
 	clientsMu.RUnlock()
@@ -147,6 +168,13 @@ func HTTPClient() *http.Client {
 	return c
 }
 func WebSocketDialer() *websocket.Dialer {
+	// Priority: sing-box clients
+	sbMu.Lock()
+	sbC := sbClients
+	sbMu.Unlock()
+	if sbC != nil {
+		return sbC.WebSocket
+	}
 	clientsMu.RLock()
 	p, c := proxyPool, clients.WebSocket
 	clientsMu.RUnlock()

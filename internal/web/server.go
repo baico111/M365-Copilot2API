@@ -1852,16 +1852,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	body.ConversationID = firstNonEmpty(body.ConversationID, body.ConversationIDC)
 	body.SessionID = firstNonEmpty(body.SessionID, body.SessionIDC)
 	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), len(raw))
-	repaired, err := validateAndRepairToolConversation(body.Messages)
-	if err != nil {
-		log.Printf("[req-trace] id=%s stage=validate_tool_conversation_failed err=%q", requestID, err.Error())
+	if err := validateToolConversation(body.Messages); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "tool_protocol_error", err.Error())
 		return
 	}
-	if len(repaired) != len(body.Messages) {
-		log.Printf("[req-trace] id=%s stage=tool_conversation_repaired messages=%d->%d", requestID, len(body.Messages), len(repaired))
-	}
-	body.Messages = repaired
 	// Rebuild a protocol-neutral evidence ledger from actual tool calls/results.
 	// Round limits apply only to the current user turn; full history still informs evidence.
 	ledger := buildAgentLedger(body.Messages)

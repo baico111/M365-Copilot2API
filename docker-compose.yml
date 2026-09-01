@@ -26,6 +26,12 @@ services:
       M365_PUBLIC_IDENTITY_POLICY: "${M365_PUBLIC_IDENTITY_POLICY:-false}"
       # Token 加密主密钥 — 强烈建议设置，生成方法: openssl rand -base64 32
       M365_MASTER_KEY: "${M365_MASTER_KEY:-}"
+      # sing-box 订阅地址 — 填入你的 VLESS/VMess/SS 订阅链接
+      # sing-box 会自动解析节点并随机轮换，每次请求走不同出口 IP
+      # 留空则不启用代理
+      M365_SINGBOX_SUBSCRIPTION: "${M365_SINGBOX_SUBSCRIPTION:-}"
+      # sing-box 本地 SOCKS5 监听端口（容器内部，默认 11080）
+      M365_SINGBOX_LOCAL_PORT: "${M365_SINGBOX_LOCAL_PORT:-11080}"
     volumes:
       - ./data:/data
       - ./secrets/m365_admin_password:/run/secrets/m365_admin_password:ro

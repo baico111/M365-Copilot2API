@@ -3,7 +3,6 @@ package web
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"time"
 
@@ -13,10 +12,7 @@ import (
 // writeResponsesResult projects an internal OpenAI-style result into the
 // Responses events and completion shape consumed by Codex.
 func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src map[string]any) {
-	id, _ := src["m365_response_id"].(string)
-	if id == "" {
-		id = "resp_" + uuid.NewString()
-	}
+	id := firstNonEmpty(fmt.Sprint(src["m365_response_id"]), "resp_"+uuid.NewString())
 	msg, _ := openAIChoice(src)
 	sanitizePublicAssistantMessage(msg, model)
 	var output []any
@@ -24,26 +20,11 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 		for _, raw := range calls {
 			tc, _ := raw.(map[string]any)
 			fn, _ := tc["function"].(map[string]any)
-			callID, _ := tc["id"].(string)
-			if callID == "" {
-				callID = "call_" + uuid.NewString()
-			}
-			nameStr, _ := fn["name"].(string)
 			if tc["type"] == "custom" {
-				input := customToolInput(fn["arguments"])
-				// id is derived from call_id so clients can correlate the two fields.
-				output = append(output, map[string]any{"type": "custom_tool_call", "id": "ctc_" + callID, "call_id": callID, "name": nameStr, "input": input, "status": "completed"})
-				log.Printf("[responses-output] type=custom_tool_call name=%s call_id=%s input_len=%d", nameStr, callID, len(input))
+				output = append(output, map[string]any{"type": "custom_tool_call", "id": "ctc_" + uuid.NewString(), "call_id": tc["id"], "name": fn["name"], "input": customToolInput(fn["arguments"]), "status": "completed"})
 				continue
 			}
-				args := ensureJSONString(fn["arguments"])
-			if nameStr == "" {
-				log.Printf("[responses-output] WARNING: function.name is empty! tc=%+v fn=%+v", tc, fn)
-				nameStr = "unknown"
-			}
-			// id is derived from call_id so clients can correlate the two fields.
-			output = append(output, map[string]any{"type": "function_call", "id": "fc_" + callID, "call_id": callID, "name": nameStr, "arguments": args, "status": "completed"})
-			log.Printf("[responses-output] type=function_call name=%s call_id=%s args_len=%d", nameStr, callID, len(args))
+			output = append(output, map[string]any{"type": "function_call", "id": "fc_" + uuid.NewString(), "call_id": tc["id"], "name": fn["name"], "arguments": fn["arguments"], "status": "completed"})
 		}
 	} else {
 		text, _ := msg["content"].(string)
@@ -62,9 +43,6 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 	}
 	resp := map[string]any{"id": id, "object": "response", "created_at": time.Now().Unix(), "status": "completed", "model": model, "output": output, "usage": usage, "m365": localUsageMetadata(usageSource)}
 	if !stream {
-		if respBody, err := json.Marshal(resp); err == nil {
-			log.Printf("[responses-output] non_stream_response body=%s", string(respBody))
-		}
 		jsonOut(w, resp)
 		return
 	}
@@ -125,29 +103,4 @@ func customToolInput(arguments any) string {
 		}
 	}
 	return ""
-}
-
-// ensureJSONString guarantees that arguments is a valid JSON string.
-// If the value is already a string, it is returned as-is if it parses as
-// JSON; otherwise it is wrapped in braces. Non-string values are marshalled.
-func ensureJSONString(v any) string {
-	if v == nil {
-		return "{}"
-	}
-	if s, ok := v.(string); ok {
-		if s == "" {
-			return "{}"
-		}
-		var probe any
-		if json.Unmarshal([]byte(s), &probe) == nil {
-			return s
-		}
-		b, _ := json.Marshal(s)
-		return string(b)
-	}
-	b, err := json.Marshal(v)
-	if err != nil {
-		return "{}"
-	}
-	return string(b)
 }

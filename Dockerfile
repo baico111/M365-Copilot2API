@@ -17,6 +17,15 @@ FROM alpine:3.20
 RUN apk add --no-cache wget ca-certificates tzdata \
     && addgroup -S m365 && adduser -S -G m365 m365 \
     && mkdir -p /data /app
+
+# Install sing-box for VLESS/VMess/SS subscription proxy support
+RUN wget -qO /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-amd64.tar.gz" \
+    && tar -xzf /tmp/sing-box.tar.gz -C /tmp \
+    && cp /tmp/sing-box-*/sing-box /usr/local/bin/sing-box \
+    && chmod +x /usr/local/bin/sing-box \
+    && rm -rf /tmp/sing-box*
+
+ENV M365_SINGBOX_BINARY=/usr/local/bin/sing-box
 WORKDIR /app
 COPY --from=build /out/m365-copilot2api /app/m365-copilot2api
 COPY --from=build /src/web /app/web

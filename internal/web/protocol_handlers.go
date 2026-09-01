@@ -24,7 +24,9 @@ import (
 // scheme matches session_resolver.explicitKey and userSessionStore.userKey.
 func responseNamespace(tenant, sessionID string) string { return tenant + "\x00" + sessionID }
 
-func responseSessionID(r *http.Request) string { return strings.TrimSpace(r.Header.Get(sessionHeaderName)) }
+func responseSessionID(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get(sessionHeaderName))
+}
 
 func tenantHashPrefix(tenant string) string {
 	if len(tenant) >= 8 {
@@ -193,20 +195,13 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 					typ = "custom"
 				}
 				if st == nil {
-					// Synthesize a call_id now so the added event has a non-empty value;
-					// if the upstream stream provides one later, we override st.ID.
-					synthCallID := "call_" + uuid.NewString()
 					prefix := "fc_"
-					// Read function name from the same delta chunk so the added
-					// event is never emitted with an empty name.
-					initFn, _ := tc["function"].(map[string]any)
-					initName, _ := initFn["name"].(string)
-					item := map[string]any{"type": "function_call", "call_id": synthCallID, "name": initName, "arguments": "", "status": "in_progress"}
+					item := map[string]any{"type": "function_call", "call_id": "", "name": "", "arguments": "", "status": "in_progress"}
 					if typ == "custom" {
 						prefix = "ctc_"
-						item = map[string]any{"type": "custom_tool_call", "call_id": synthCallID, "name": initName, "input": "", "status": "in_progress"}
+						item = map[string]any{"type": "custom_tool_call", "call_id": "", "name": "", "input": "", "status": "in_progress"}
 					}
-					st = &tcState{ID: synthCallID, Name: initName, ItemID: prefix + synthCallID, Type: typ}
+					st = &tcState{ItemID: prefix + uuid.NewString(), Type: typ}
 					calls[idx] = st
 					item["id"] = st.ItemID
 					emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
@@ -215,10 +210,8 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 					st.ID = v
 				}
 				fn, _ := tc["function"].(map[string]any)
-				if v, ok := fn["name"].(string); ok && v != "" {
-					if st.Name == "" {
-						st.Name = v
-					}
+				if v, ok := fn["name"].(string); ok {
+					st.Name += v
 				}
 				if v, ok := fn["arguments"].(string); ok {
 					st.Args += v
@@ -269,36 +262,18 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			if st == nil {
 				continue
 			}
-			callID := st.ID
-			if callID == "" {
-				callID = "call_" + uuid.NewString()
-			}
-			// Derive item id from call_id so the two fields stay correlated,
-			// matching the non-stream path and the reference CLIProxyAPI project.
-			itemID := "fc_" + callID
-			if st.Type == "custom" {
-				itemID = "ctc_" + callID
-			}
 			if st.Type == "custom" {
 				input := customToolInput(st.Args)
-				ctcName := st.Name
-			if ctcName == "" {
-				ctcName = "unknown"
-			}
-			item := map[string]any{"type": "custom_tool_call", "id": itemID, "call_id": callID, "name": ctcName, "input": input, "status": "completed"}
+				item := map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": input, "status": "completed"}
 				output = append(output, item)
-				emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": i, "item_id": itemID, "delta": input})
-				emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": i, "item_id": itemID, "input": input})
+				emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": i, "item_id": item["id"], "delta": input})
+				emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": i, "item_id": item["id"], "input": input})
 				emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
 				continue
 			}
-			name := st.Name
-			if name == "" {
-				name = "unknown"
-			}
-			item := map[string]any{"type": "function_call", "id": itemID, "call_id": callID, "name": name, "arguments": st.Args, "status": "completed"}
+			item := map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": st.Args, "status": "completed"}
 			output = append(output, item)
-			emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": i, "item_id": itemID, "arguments": st.Args})
+			emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": i, "item_id": st.ItemID, "arguments": st.Args})
 			emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
 		}
 	} else {
@@ -331,14 +306,9 @@ func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []
 	r2.ContentLength = int64(len(b))
 	rr := httptest.NewRecorder()
 	s.openaiChat(rr, r2)
-	status := rr.Code
-	if status == 0 {
-		status = http.StatusOK
-	}
-	log.Printf("[responses] adapter_raw status=%d body_len=%d body_preview=%.200s", status, rr.Body.Len(), rr.Body.String())
 	var out map[string]any
 	err := json.Unmarshal(rr.Body.Bytes(), &out)
-	return out, rr.Body.Bytes(), status, err
+	return out, rr.Body.Bytes(), rr.Code, err
 }
 
 func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
@@ -357,19 +327,6 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		writeResponsesError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
-	// Repair orphaned tool results (e.g. function_call_output from a previous
-	// response whose function_call is no longer in the input array) before the
-	// message reaches the upstream backend which requires strict adjacency.
-	repaired, repairErr := validateAndRepairToolConversation(o.Messages)
-	if repairErr != nil {
-		log.Printf("[responses] tool_protocol_error: %s messages=%d", repairErr.Error(), len(o.Messages))
-		writeResponsesError(w, 400, "tool_protocol_error", repairErr.Error())
-		return
-	}
-	if len(repaired) != len(o.Messages) {
-		log.Printf("[responses] tool_conversation_repaired messages=%d->%d", len(o.Messages), len(repaired))
-	}
-	o.Messages = repaired
 	// Dual isolation: tenant\x00session so two keys never share history and
 	// within one tenant two explicit sessions (X-M365-Session-Id) cannot
 	// cross-read. Falls back to 8-char prefix display only for legacy callers
@@ -458,7 +415,6 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, raw, status, err := s.runOpenAIAdapter(r, o)
-	log.Printf("[responses] adapter_done status=%d raw_len=%d err=%v has_content=%t", status, len(raw), err, responsesOutputHasContent(out))
 	if status >= 400 {
 		writeResponsesError(w, status, "upstream_error", errorMessage(raw, "upstream protocol error"))
 		return
@@ -540,22 +496,6 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		bucket[publicID] = &RespNode{At: time.Now(), Messages: stored, ToolCalls: toolCallsMap, Version: 1, Consumed: false, ParentID: body.PreviousResponseID, Tenant: tenant, SessionID: sessionID}
 		s.responseMu.Unlock()
 		log.Printf("[responses-audit] tenantHash=%s session=%s new=%s parent=%s toolCalls=%d version=1", tenantHashPrefix(tenant), sessionHashPrefix(sessionID), publicID, body.PreviousResponseID, len(toolCallsMap))
-	}
-	if msg, _ := openAIChoice(out); msg != nil {
-		hasCalls := false
-		if calls, ok := msg["tool_calls"].([]any); ok && len(calls) > 0 {
-			hasCalls = true
-			for _, raw := range calls {
-				if tc, ok := raw.(map[string]any); ok {
-					fn, _ := tc["function"].(map[string]any)
-					log.Printf("[responses-output] pre_write tool_call id=%v type=%v name=%v args_type=%T args_val=%.200v", tc["id"], tc["type"], fn["name"], fn["arguments"], fn["arguments"])
-				}
-			}
-		}
-		if !hasCalls {
-			text, _ := msg["content"].(string)
-			log.Printf("[responses-output] pre_write message text_len=%d preview=%.200s", len(text), text)
-		}
 	}
 	writeResponsesResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)
 }
