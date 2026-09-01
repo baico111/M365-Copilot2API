@@ -111,11 +111,11 @@ func (s *Server) confirmRateLimitNotice(ctx context.Context, acc auth.AccountTok
 		OID:         acc.OID,
 		TID:         acc.TID,
 	}, chathub.Request{
-		Text:        rateLimitProbePrompt,
-		Tone:        "magic",
-		Started:     true,
-		LicenseType: probeSettings.LicenseType,
-		Scenario:    probeSettings.Scenario,
+		Text:         rateLimitProbePrompt,
+		Tone:         "magic",
+		Started:      true,
+		LicenseType:  probeSettings.LicenseType,
+		Scenario:     probeSettings.Scenario,
 		FeatureFlags: s.featureFlags(),
 	})
 	if probeErr == nil {
@@ -147,15 +147,15 @@ type Server struct {
 	adminSessions        map[string]time.Time
 	mustChangePassword   bool
 	loginAttempts        map[string]loginAttempt
-	apiKeys             *apiKeyStore
-	debug               *debugStore
-	settings            *settingsStore
-	responseMu          sync.Mutex
-	responseMessages    map[string]map[string]*RespNode
-	usage               *usageLog
-	generatedImages     map[string]generatedImage
-	convCache           *conversationCache
-	lastHealthyAccount  string
+	apiKeys              *apiKeyStore
+	debug                *debugStore
+	settings             *settingsStore
+	responseMu           sync.Mutex
+	responseMessages     map[string]map[string]*RespNode
+	usage                *usageLog
+	generatedImages      map[string]generatedImage
+	convCache            *conversationCache
+	lastHealthyAccount   string
 }
 
 const maxResponsesPerTenant = 256
@@ -173,11 +173,11 @@ func (s *Server) clientForProxy(proxyURL string) *chathub.Client {
 		return s.chat
 	}
 	c := &chathub.Client{
-		HTTPHeader:  make(http.Header),
-		HTTPClient:  clients.HTTP,
-		Dialer:      clients.WebSocket,
-		Pool:        chathub.NewConnPool(clients.WebSocket, make(http.Header)),
-		Trace:       s.chat.Trace,
+		HTTPHeader: make(http.Header),
+		HTTPClient: clients.HTTP,
+		Dialer:     clients.WebSocket,
+		Pool:       chathub.NewConnPool(clients.WebSocket, make(http.Header)),
+		Trace:      s.chat.Trace,
 	}
 	c.HTTPHeader.Set("Origin", "https://m365.cloud.microsoft")
 	c.HTTPHeader.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0")
@@ -193,14 +193,14 @@ type ToolCallRecord struct {
 }
 
 type RespNode struct {
-	At        time.Time                 `json:"at"`
-	Messages  []oaiMsg                  `json:"messages"`
+	At        time.Time                  `json:"at"`
+	Messages  []oaiMsg                   `json:"messages"`
 	ToolCalls map[string]*ToolCallRecord `json:"tool_calls,omitempty"`
-	Version   int64                     `json:"version"`
-	Consumed  bool                      `json:"consumed"`
-	ParentID  string                    `json:"parent_id,omitempty"`
-	Tenant    string                    `json:"tenant,omitempty"`
-	SessionID string                    `json:"session_id,omitempty"`
+	Version   int64                      `json:"version"`
+	Consumed  bool                       `json:"consumed"`
+	ParentID  string                     `json:"parent_id,omitempty"`
+	Tenant    string                     `json:"tenant,omitempty"`
+	SessionID string                     `json:"session_id,omitempty"`
 }
 
 // respHistory is kept as an alias so older code or tests referencing the old
@@ -236,22 +236,22 @@ func New() (*Server, error) {
 			c.Trace = func(meta map[string]any) { fmt.Printf("[multimodal-trace] %s\\n", mustJSON(meta)) }
 			return c
 		}(),
-		sessions:            openSessionStore(),
-		userSessions:        openUserSessionStore(sessionTTL),
-		sessionResolver:     openSessionResolver(),
-		conversationManager: openConversationManager(),
+		sessions:             openSessionStore(),
+		userSessions:         openUserSessionStore(sessionTTL),
+		sessionResolver:      openSessionResolver(),
+		conversationManager:  openConversationManager(),
 		adminPassword:        password,
 		adminPasswordHistory: history,
-		adminSessions:       map[string]time.Time{},
-		mustChangePassword:  mustChange,
-		loginAttempts:       map[string]loginAttempt{},
-		apiKeys:             openAPIKeys(),
-		debug:               openDebugStore(),
-		settings:            openSettingsStore(),
-		responseMessages:    map[string]map[string]*RespNode{},
-		usage:               openUsageLog(),
-		generatedImages:     map[string]generatedImage{},
-		convCache:           newConversationCache(),
+		adminSessions:        map[string]time.Time{},
+		mustChangePassword:   mustChange,
+		loginAttempts:        map[string]loginAttempt{},
+		apiKeys:              openAPIKeys(),
+		debug:                openDebugStore(),
+		settings:             openSettingsStore(),
+		responseMessages:     map[string]map[string]*RespNode{},
+		usage:                openUsageLog(),
+		generatedImages:      map[string]generatedImage{},
+		convCache:            newConversationCache(),
 	}, nil
 }
 
@@ -597,6 +597,7 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, 405, "invalid_request_error", "method not allowed")
 	}
 }
+
 // rawAPIKey returns the full API key presented by the caller (X-API-Key or
 // Authorization: Bearer), or "" when none is present. Unlike extractAPIKey it
 // does not truncate: callers that use the key as a tenant/isolation identity
@@ -697,10 +698,10 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		out = append(out, view{
 			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
 			Status: status, ScheduleEnabled: !a.ScheduleDisabled, CallCount: callCount, RateLimited: rateLimited,
-			ImageLimited: imageLimited,
-			AuthFailed: s.accountPool != nil && !s.accountPool.Available(a.ID) && authFailReason != "",
+			ImageLimited:   imageLimited,
+			AuthFailed:     s.accountPool != nil && !s.accountPool.Available(a.ID) && authFailReason != "",
 			AuthFailReason: authFailReason,
-			CooldownUntil: cooldownUntil, Throttling: throttling, Concurrency: concurrency,
+			CooldownUntil:  cooldownUntil, Throttling: throttling, Concurrency: concurrency,
 			OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt, BoundProxy: a.BoundProxy,
 		})
@@ -817,8 +818,8 @@ func (s *Server) probeAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		ID    string `json:"id"`
-		All   bool   `json:"all"`
+		ID  string `json:"id"`
+		All bool   `json:"all"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "bad json")
@@ -826,21 +827,21 @@ func (s *Server) probeAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type probeResult struct {
-		ID            string `json:"id"`
-		Email         string `json:"email"`
-		DisplayName  string `json:"displayName"`
-		Alive         bool   `json:"alive"`
-		Status        string `json:"status"`
-		ErrorCategory string `json:"errorCategory,omitempty"`
-		ErrorReason   string `json:"errorReason,omitempty"`
+		ID            string     `json:"id"`
+		Email         string     `json:"email"`
+		DisplayName   string     `json:"displayName"`
+		Alive         bool       `json:"alive"`
+		Status        string     `json:"status"`
+		ErrorCategory string     `json:"errorCategory,omitempty"`
+		ErrorReason   string     `json:"errorReason,omitempty"`
 		CooldownUntil *time.Time `json:"cooldownUntil,omitempty"`
-		LatencyMS     int64 `json:"latencyMs"`
+		LatencyMS     int64      `json:"latencyMs"`
 	}
 
 	probeOne := func(acc auth.AccountToken) probeResult {
 		result := probeResult{
-			ID:       acc.ID,
-			Email:    acc.Email,
+			ID:          acc.ID,
+			Email:       acc.Email,
 			DisplayName: acc.DisplayName,
 		}
 
@@ -1171,20 +1172,9 @@ func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 	if accountID == "" {
-		// Failover mode: prefer the last healthy account, only rotate on failure.
-		// But only if it still has concurrency capacity — otherwise multiple
-		// concurrent requests would all pile onto the same account.
-		s.mu.Lock()
-		preferred := s.lastHealthyAccount
-		s.mu.Unlock()
-		if preferred != "" && s.accountAvailable(preferred) && s.accountPool.Available(preferred) && s.accountConcurrency.Available(preferred) {
-			if acc, err := s.tokens.EnsureValid(preferred); err == nil {
-				accountID = preferred
-				return acc, nil
-			}
-		}
-		// No preferred account or it's unavailable/concurrency-full; fall back to round-robin
-		// Iterate through ALL accounts to find one that is healthy AND has concurrency capacity.
+		// Pure round-robin: always rotate to the next healthy account.
+		// This distributes load evenly across all accounts and ensures
+		// different accounts (and thus different exit IPs) are used.
 		seen := make(map[string]bool)
 		var firstUnavailable string
 		for i := 0; i < 256; i++ {
@@ -1212,9 +1202,6 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 			// Found a healthy account with capacity
 			result, err := s.tokens.EnsureValid(accountID)
 			if err == nil {
-				s.mu.Lock()
-				s.lastHealthyAccount = accountID
-				s.mu.Unlock()
 				return result, nil
 			}
 		}
@@ -1230,11 +1217,6 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 		return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: 1, Body: "all accounts are at their concurrency limit; try again shortly"}
 	}
 	result, err := s.tokens.EnsureValid(accountID)
-	if err == nil {
-		s.mu.Lock()
-		s.lastHealthyAccount = accountID
-		s.mu.Unlock()
-	}
 	return result, err
 }
 
@@ -1305,18 +1287,18 @@ func (s *Server) nextHealthyAccountMulti(tried map[string]bool) (auth.AccountTok
 }
 
 type chatBody struct {
-	AccountID            string               `json:"accountId"`
-	Message              string               `json:"message"`
-	Prompt               string               `json:"prompt"`
-	Tone                 string               `json:"tone"`
-	ConversationID       string               `json:"conversationId"`
-	SessionID            string               `json:"sessionId"`
-	SessionKey           string               `json:"sessionKey"`
-	ConversationSignature string              `json:"conversationSignature"`
-	Attachments          []chathub.Attachment `json:"attachments,omitempty"`
-	PreviousMessages     []chathub.ContextMessage `json:"previousMessages,omitempty"`
-	ConnectedFederatedIDs []string            `json:"connectedFederatedIds,omitempty"`
-	Tools                []chathub.Tool       `json:"tools,omitempty"`
+	AccountID             string                   `json:"accountId"`
+	Message               string                   `json:"message"`
+	Prompt                string                   `json:"prompt"`
+	Tone                  string                   `json:"tone"`
+	ConversationID        string                   `json:"conversationId"`
+	SessionID             string                   `json:"sessionId"`
+	SessionKey            string                   `json:"sessionKey"`
+	ConversationSignature string                   `json:"conversationSignature"`
+	Attachments           []chathub.Attachment     `json:"attachments,omitempty"`
+	PreviousMessages      []chathub.ContextMessage `json:"previousMessages,omitempty"`
+	ConnectedFederatedIDs []string                 `json:"connectedFederatedIds,omitempty"`
+	Tools                 []chathub.Tool           `json:"tools,omitempty"`
 	// Legacy OpenAI-compatible clients still send functions/function_call.
 	Functions       []json.RawMessage `json:"functions,omitempty"`
 	ToolChoice      any               `json:"tool_choice,omitempty"`
@@ -1519,24 +1501,24 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	jsonOut(w, map[string]any{
-		"status":              "ok",
-		"text":                res.Text,
-		"conversationId":      res.ConversationID,
-		"sessionId":           res.SessionID,
-		"requestId":           res.RequestID,
-		"throttling":          res.Throttling,
-		"suggestedResponses":  res.SuggestedResponses,
-		"result":              res.RawResult,
-		"events":              res.Events,
-		"images":              res.Images,
-		"account":             map[string]any{"id": acc.ID, "email": acc.Email},
-		"offense":             res.Offense,
-		"scores":              res.Scores,
+		"status":                    "ok",
+		"text":                      res.Text,
+		"conversationId":            res.ConversationID,
+		"sessionId":                 res.SessionID,
+		"requestId":                 res.RequestID,
+		"throttling":                res.Throttling,
+		"suggestedResponses":        res.SuggestedResponses,
+		"result":                    res.RawResult,
+		"events":                    res.Events,
+		"images":                    res.Images,
+		"account":                   map[string]any{"id": acc.ID, "email": acc.Email},
+		"offense":                   res.Offense,
+		"scores":                    res.Scores,
 		"conversationTransferToken": res.ConversationTransferToken,
-		"meteringInformation": res.MeteringInformation,
-		"spokenText":          res.SpokenText,
-		"storageMessageId":   res.StorageMessageID,
-		"timestamps":         res.Timestamps,
+		"meteringInformation":       res.MeteringInformation,
+		"spokenText":                res.SpokenText,
+		"storageMessageId":          res.StorageMessageID,
+		"timestamps":                res.Timestamps,
 	})
 }
 
@@ -1605,7 +1587,7 @@ func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	testCfg := s.settings.get()
 	res, err := s.chatWithAccount(ctx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{
-		Text: `Say "OK" in one word.`,
+		Text:         `Say "OK" in one word.`,
 		Tone:         tone,
 		LicenseType:  testCfg.LicenseType,
 		Scenario:     testCfg.Scenario,
@@ -1644,40 +1626,40 @@ type oaiMsg struct {
 }
 
 type oaiReq struct {
-	Model               string          `json:"model"`
-	ResponseFormat      *responseFormat `json:"response_format,omitempty"`
-	Messages            []oaiMsg        `json:"messages"`
-	Stream              bool            `json:"stream"`
-	StreamOptions       *struct {
+	Model          string          `json:"model"`
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+	Messages       []oaiMsg        `json:"messages"`
+	Stream         bool            `json:"stream"`
+	StreamOptions  *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options,omitempty"`
-	MaxTokens           *int              `json:"max_tokens,omitempty"`
-	MaxCompletionTokens *int              `json:"max_completion_tokens,omitempty"`
-	Temperature         *float64          `json:"temperature,omitempty"`
-	TopP                *float64          `json:"top_p,omitempty"`
-	FrequencyPenalty    *float64          `json:"frequency_penalty,omitempty"`
-	PresencePenalty     *float64          `json:"presence_penalty,omitempty"`
-	Stop                any               `json:"stop,omitempty"`
-	N                   *int              `json:"n,omitempty"`
-	Seed                *int64            `json:"seed,omitempty"`
-	Logprobs            *bool             `json:"logprobs,omitempty"`
-	TopLogprobs         *int              `json:"top_logprobs,omitempty"`
-	User                string            `json:"user"`
-	AccountID           string            `json:"accountId"`
-	ConversationID      string            `json:"conversation_id"`
-	SessionID           string            `json:"session_id"`
-	SessionKey          string            `json:"session_key"`
-	ConversationIDC     string            `json:"conversationId,omitempty"`
-	SessionIDC          string            `json:"sessionId,omitempty"`
+	MaxTokens           *int                 `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int                 `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64             `json:"temperature,omitempty"`
+	TopP                *float64             `json:"top_p,omitempty"`
+	FrequencyPenalty    *float64             `json:"frequency_penalty,omitempty"`
+	PresencePenalty     *float64             `json:"presence_penalty,omitempty"`
+	Stop                any                  `json:"stop,omitempty"`
+	N                   *int                 `json:"n,omitempty"`
+	Seed                *int64               `json:"seed,omitempty"`
+	Logprobs            *bool                `json:"logprobs,omitempty"`
+	TopLogprobs         *int                 `json:"top_logprobs,omitempty"`
+	User                string               `json:"user"`
+	AccountID           string               `json:"accountId"`
+	ConversationID      string               `json:"conversation_id"`
+	SessionID           string               `json:"session_id"`
+	SessionKey          string               `json:"session_key"`
+	ConversationIDC     string               `json:"conversationId,omitempty"`
+	SessionIDC          string               `json:"sessionId,omitempty"`
 	Attachments         []chathub.Attachment `json:"attachments,omitempty"`
 	Tools               []chathub.Tool       `json:"tools,omitempty"`
-	Functions           []json.RawMessage `json:"functions,omitempty"`
-	ToolChoice          any               `json:"tool_choice,omitempty"`
-	FunctionCall        any               `json:"function_call,omitempty"`
-	ParallelToolCalls   *bool             `json:"parallel_tool_calls,omitempty"`
-	Reasoning           *reasoningConfig  `json:"reasoning,omitempty"`
-	ReasoningEffort     string            `json:"reasoning_effort,omitempty"`
-	Metadata            *oaiMetadata      `json:"metadata,omitempty"`
+	Functions           []json.RawMessage    `json:"functions,omitempty"`
+	ToolChoice          any                  `json:"tool_choice,omitempty"`
+	FunctionCall        any                  `json:"function_call,omitempty"`
+	ParallelToolCalls   *bool                `json:"parallel_tool_calls,omitempty"`
+	Reasoning           *reasoningConfig     `json:"reasoning,omitempty"`
+	ReasoningEffort     string               `json:"reasoning_effort,omitempty"`
+	Metadata            *oaiMetadata         `json:"metadata,omitempty"`
 }
 
 type oaiMetadata struct {
@@ -2817,7 +2799,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		if routeErr == nil {
 			calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 			if !parsed {
-			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+				repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
 				if repairErr == nil {
 					calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 				}
@@ -3001,11 +2983,11 @@ func (s *Server) writePublicIdentityChatResponse(w http.ResponseWriter, r *http.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			writeOpenAIError(w, http.StatusInternalServerError, "server_error", "stream unsupported")
-			return
-		}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeOpenAIError(w, http.StatusInternalServerError, "server_error", "stream unsupported")
+		return
+	}
 	chunk := map[string]any{
 		"id":      id,
 		"object":  "chat.completion.chunk",

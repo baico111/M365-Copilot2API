@@ -29,7 +29,7 @@ type SingBoxConfig struct {
 }
 
 const (
-	envSubscription = "M365_SINGBOX_SUBSCRIPTION"
+	envSubscription  = "M365_SINGBOX_SUBSCRIPTION"
 	envBinaryPath    = "M365_SINGBOX_BINARY"
 	envConfigDir     = "M365_SINGBOX_CONFIG_DIR"
 	envLocalPort     = "M365_SINGBOX_LOCAL_PORT"
@@ -38,11 +38,13 @@ const (
 )
 
 var (
-	sbMu       sync.Mutex
-	sbConfig   *SingBoxConfig
-	sbProcess  *exec.Cmd
-	sbClients  *Clients // clients pointed at the local sing-box SOCKS5
-	sbNodeList []string // node names for status reporting
+	sbMu          sync.Mutex
+	sbConfig      *SingBoxConfig
+	sbProcess     *exec.Cmd
+	sbClients     *Clients         // clients pointed at the local sing-box SOCKS5 (urltest / fallback)
+	sbNodeClients map[int]*Clients // per-node clients: node index → Clients
+	sbNodeList    []string         // node names for status reporting
+	sbNodePorts   map[int]int      // node index → local SOCKS5 port
 )
 
 func defaultSingBoxConfig() *SingBoxConfig {
@@ -120,15 +122,26 @@ func ConfigureSingBox(subscriptionURL string) error {
 		log.Printf("[sing-box] warning: local port %d not reachable after 6s, proceeding anyway", cfg.LocalPort)
 	}
 
+	// Build per-node clients (each port → specific exit IP)
+	nodeClients := make(map[int]*Clients, len(nodes))
+	nodePorts := make(map[int]int, len(nodes))
+	for i := range nodes {
+		port := cfg.LocalPort + 1 + i
+		nodeClients[i] = buildLocalSOCKS5Clients(port)
+		nodePorts[i] = port
+	}
+
 	sbMu.Lock()
 	sbConfig = cfg
 	sbProcess = cmd
 	sbNodeList = nodeNames(nodes)
-	// Build clients pointing at the local SOCKS5
+	// Main clients (urltest auto-select) + per-node clients
 	sbClients = buildLocalSOCKS5Clients(cfg.LocalPort)
+	sbNodeClients = nodeClients
+	sbNodePorts = nodePorts
 	sbMu.Unlock()
 
-	log.Printf("[sing-box] started with %d nodes on port %d", len(nodes), cfg.LocalPort)
+	log.Printf("[sing-box] started with %d nodes on port %d (per-node ports %d-%d)", len(nodes), cfg.LocalPort, cfg.LocalPort+1, cfg.LocalPort+len(nodes))
 
 	// Wait for sing-box in background; restart on exit
 	go func() {
@@ -200,11 +213,22 @@ func refreshLoop(cfg *SingBoxConfig) {
 			_ = reloadCmd.Process.Kill()
 			continue
 		}
+		// Build per-node clients for the refreshed node set
+		nodeClients := make(map[int]*Clients, len(nodes))
+		nodePorts := make(map[int]int, len(nodes))
+		for i := range nodes {
+			port := cfg.LocalPort + 1 + i
+			nodeClients[i] = buildLocalSOCKS5Clients(port)
+			nodePorts[i] = port
+		}
 		// New process is ready — kill old one
 		sbMu.Lock()
 		oldCmd := sbProcess
 		sbProcess = reloadCmd
 		sbNodeList = nodeNames(nodes)
+		sbClients = buildLocalSOCKS5Clients(cfg.LocalPort)
+		sbNodeClients = nodeClients
+		sbNodePorts = nodePorts
 		sbMu.Unlock()
 		if oldCmd != nil && oldCmd.Process != nil {
 			_ = oldCmd.Process.Signal(os.Interrupt)
@@ -237,18 +261,18 @@ func buildLocalSOCKS5Clients(port int) *Clients {
 // ---- Subscription parsing ----
 
 type vlessNode struct {
-	UUID     string
-	Address  string
-	Port     int
-	Network  string // ws, tcp, etc.
-	TLS      bool
-	SNI      string
-	Host     string
-	Path     string
-	FP       string
-	Alpn     string
-	Name     string
-	Raw      string
+	UUID    string
+	Address string
+	Port    int
+	Network string // ws, tcp, etc.
+	TLS     bool
+	SNI     string
+	Host    string
+	Path    string
+	FP      string
+	Alpn    string
+	Name    string
+	Raw     string
 }
 
 func fetchSubscription(rawURL string) ([]vlessNode, error) {
@@ -495,6 +519,10 @@ func nodeNames(nodes []vlessNode) []string {
 
 // ---- sing-box config generation ----
 
+// maxNodeInbounds caps the number of per-node SOCKS5 inbounds. Each node
+// gets its own local port so accounts can be distributed across IPs.
+const maxNodeInbounds = 50
+
 func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) error {
 	if err := os.MkdirAll(cfg.ConfigDir, 0o755); err != nil {
 		return err
@@ -502,7 +530,7 @@ func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) error {
 
 	// Use all nodes — sing-box urltest will auto-pick fastest.
 	// We also shuffle so each restart rotates the order.
-	selected := selectRandomNodes(nodes, 50)
+	selected := selectRandomNodes(nodes, maxNodeInbounds)
 
 	var outbounds []map[string]any
 
@@ -546,13 +574,13 @@ func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) error {
 
 	// urltest: auto-select lowest latency node (sing-box built-in)
 	urltestOut := map[string]any{
-		"tag":           "proxy",
-		"type":          "urltest",
-		"outbounds":     nodeTags,
-		"url":           "https://www.gstatic.com/generate_204",
-		"interval":      "5m",
-		"tolerance":     50,
-		"idle_timeout":  "30m",
+		"tag":          "proxy",
+		"type":         "urltest",
+		"outbounds":    nodeTags,
+		"url":          "https://www.gstatic.com/generate_204",
+		"interval":     "5m",
+		"tolerance":    50,
+		"idle_timeout": "30m",
 	}
 	outbounds = append(outbounds, urltestOut)
 
@@ -560,25 +588,44 @@ func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) error {
 	outbounds = append(outbounds, map[string]any{"tag": "direct", "type": "direct"})
 	outbounds = append(outbounds, map[string]any{"tag": "block", "type": "block"})
 
-	// inbound: mixed (socks5 + http) on local port
-	inbound := map[string]any{
+	// Build inbounds: one main mixed inbound (urltest) + one SOCKS5 inbound
+	// per node so each account can be pinned to a specific exit IP.
+	var inbounds []any
+	inbounds = append(inbounds, map[string]any{
 		"tag":         "mixed-in",
 		"type":        "mixed",
 		"listen":      "127.0.0.1",
 		"listen_port": cfg.LocalPort,
+	})
+	for i := range selected {
+		port := cfg.LocalPort + 1 + i
+		inbounds = append(inbounds, map[string]any{
+			"tag":         fmt.Sprintf("in-node-%d", i),
+			"type":        "socks",
+			"listen":      "127.0.0.1",
+			"listen_port": port,
+		})
 	}
 
-	// route: default goes through proxy
+	// route: each per-node inbound routes to its matching node outbound.
+	// The main mixed-in inbound routes through the urltest (auto-select).
+	routeRules := []any{}
+	for i := range selected {
+		routeRules = append(routeRules, map[string]any{
+			"inbound":  []string{fmt.Sprintf("in-node-%d", i)},
+			"outbound": fmt.Sprintf("node-%d", i),
+		})
+	}
 	route := map[string]any{
-		"outbound": "proxy",
-		"final":    "proxy",
+		"rules": routeRules,
+		"final": "proxy",
 	}
 
 	config := map[string]any{
 		"log": map[string]any{
 			"level": "warn",
 		},
-		"inbounds":  []any{inbound},
+		"inbounds":  inbounds,
 		"outbounds": outbounds,
 		"route":     route,
 	}
@@ -636,6 +683,24 @@ func SingBoxRunning() bool {
 	sbMu.Lock()
 	defer sbMu.Unlock()
 	return sbProcess != nil
+}
+
+// SingBoxNodeCount returns the number of available per-node clients.
+func SingBoxNodeCount() int {
+	sbMu.Lock()
+	defer sbMu.Unlock()
+	return len(sbNodeClients)
+}
+
+// SingBoxNodeClient returns the Clients for a specific node index.
+// Falls back to the main urltest clients if the index is out of range.
+func SingBoxNodeClient(index int) *Clients {
+	sbMu.Lock()
+	defer sbMu.Unlock()
+	if c, ok := sbNodeClients[index]; ok {
+		return c
+	}
+	return sbClients
 }
 
 // OverrideClients replaces the global clients (used by ConfigureSingBox

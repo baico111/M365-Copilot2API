@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"m365-copilot2api/internal/chathub"
+	"m365-copilot2api/internal/outbound"
 )
 
 const defaultAccountConcurrency = 8
@@ -102,10 +103,37 @@ func (s *Server) accountAvailable(accountID string) bool {
 }
 
 func (s *Server) accountClient(accountID string) *chathub.Client {
+	// If the account has an explicitly bound proxy, use it.
 	if acc, ok := s.tokens.Get(accountID); ok && acc.BoundProxy != "" {
 		return s.clientForProxy(acc.BoundProxy)
 	}
+	// If sing-box has per-node clients, distribute accounts across nodes
+	// by hashing the account ID. This ensures each account always uses
+	// the same exit IP (sticky per account) while different accounts get
+	// different IPs.
+	if n := outbound.SingBoxNodeCount(); n > 0 {
+		nodeIdx := int(stableHash(accountID) % uint64(n))
+		clients := outbound.SingBoxNodeClient(nodeIdx)
+		return &chathub.Client{
+			HTTPHeader: s.chat.HTTPHeader,
+			HTTPClient: clients.HTTP,
+			Dialer:     clients.WebSocket,
+			Pool:       chathub.NewConnPool(clients.WebSocket, s.chat.HTTPHeader),
+			Trace:      s.chat.Trace,
+		}
+	}
 	return s.chat
+}
+
+// stableHash returns a deterministic uint64 hash for a string.
+// Uses FNV-1a for simplicity and good distribution.
+func stableHash(s string) uint64 {
+	var h uint64 = 1469598103934665603
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
+	}
+	return h
 }
 
 func (s *Server) chatWithAccount(ctx context.Context, accountID string, account chathub.Account, request chathub.Request) (chathub.Result, error) {
