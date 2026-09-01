@@ -267,6 +267,65 @@ func fetchSubscription(rawURL string) ([]vlessNode, error) {
 	return parseSubscriptionBody(string(body))
 }
 
+// splitSubscriptionLines splits a subscription body into individual
+// node URIs. Subscriptions may separate nodes by newlines, spaces, or
+// a mix of both. This function uses a regex-free approach: it scans
+// for known scheme prefixes and extracts each complete URI.
+func splitSubscriptionLines(body string) []string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return nil
+	}
+	// First try normal newline split
+	if strings.Contains(body, "\n") {
+		return strings.FieldsFunc(body, func(r rune) bool { return r == '\n' || r == '\r' })
+	}
+	// No newlines — maybe space-separated (some subscriptions do this).
+	// Split on " vless://", " vmess://", " ss://", " trojan://"
+	var lines []string
+	schemes := []string{"vless://", "vmess://", "ss://", "trojan://"}
+	remaining := body
+	for {
+		remaining = strings.TrimLeft(remaining, " \t")
+		if remaining == "" {
+			break
+		}
+		// Find the current scheme prefix
+		var curScheme string
+		for _, s := range schemes {
+			if strings.HasPrefix(remaining, s) {
+				curScheme = s
+				break
+			}
+		}
+		if curScheme == "" {
+			// Unknown line, just take up to next scheme
+			nextIdx := len(remaining)
+			for _, s := range schemes {
+				if idx := strings.Index(remaining, " "+s); idx >= 0 && idx < nextIdx {
+					nextIdx = idx
+				}
+			}
+			lines = append(lines, strings.TrimSpace(remaining[:nextIdx]))
+			remaining = remaining[nextIdx:]
+			continue
+		}
+		// Find the next scheme after the current one
+		nextIdx := len(remaining)
+		for _, s := range schemes {
+			if idx := strings.Index(remaining[len(curScheme):], " "+s); idx >= 0 {
+				absIdx := len(curScheme) + idx
+				if absIdx < nextIdx {
+					nextIdx = absIdx
+				}
+			}
+		}
+		lines = append(lines, strings.TrimSpace(remaining[:nextIdx]))
+		remaining = remaining[nextIdx:]
+	}
+	return lines
+}
+
 func parseSubscriptionBody(body string) ([]vlessNode, error) {
 	body = strings.TrimSpace(body)
 	// Try base64 decode only if the body doesn't look like plain-text URIs
@@ -278,8 +337,11 @@ func parseSubscriptionBody(body string) ([]vlessNode, error) {
 		}
 	}
 
+	// Subscriptions may separate nodes by newlines, spaces, or both.
+	// Split on any whitespace that is followed by a protocol scheme.
 	var nodes []vlessNode
-	for _, line := range strings.Split(body, "\n") {
+	lines := splitSubscriptionLines(body)
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
