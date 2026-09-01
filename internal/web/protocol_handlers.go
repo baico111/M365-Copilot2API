@@ -134,12 +134,34 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	flusher, _ := w.(http.Flusher)
+	sw := newSSEWriter(w, flusher)
 	emit := func(name string, v any) error {
 		return writeSSE(r, w, flusher, name, v)
 	}
 	id := "resp_" + uuid.NewString()
 	created := time.Now().Unix()
 	emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
+
+	// Keepalive heartbeat: when the upstream ChatHub takes a long time to
+	// produce the next token (e.g. tool execution, long reasoning), reverse
+	// proxies (nginx/Cloudflare) and clients may time out. A 15s SSE comment
+	// keeps the connection alive without emitting any data event.
+	keepaliveDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-keepaliveDone:
+				return
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				_ = sw.raw(": keepalive\n\n")
+			}
+		}
+	}()
+	defer close(keepaliveDone)
 
 	var text strings.Builder
 	messageID := "msg_" + uuid.NewString()
