@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"m365-copilot2api/internal/chathub"
+	"m365-copilot2api/internal/outbound"
 )
 
 func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
@@ -64,7 +65,9 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 			s.accountPool.MarkImageLimited(acc.ID)
 		}
-		s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+		if !outbound.IsProxyIsolated(err) {
+			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+		}
 		writeUpstreamError(w, err)
 		return
 	}

@@ -88,6 +88,18 @@ func (s *Server) markAccountResult(accountID string, err error) {
 		return
 	}
 	if err != nil {
+		// Proxy transport errors (SOCKS5, DNS, TCP, TLS, WS handshake/read
+		// timeout) are caused by the sing-box proxy layer, not by the account
+		// itself. Putting the account into cooldown for these errors causes a
+		// cascading failure: every account gets cooled down because the proxy
+		// is flaky, and resolveAccount returns 429 to the client even though
+		// the accounts are perfectly fine. Skip account cooldown for proxy-
+		// isolated errors so a transient proxy hiccup does not disable the
+		// entire account pool.
+		if outbound.IsProxyIsolated(err) {
+			log.Printf("[account-health] skipping cooldown for account=%s err=%v (proxy-isolated)", accountID, err)
+			return
+		}
 		s.accountPool.MarkFailure(accountID, err, s.getRateLimitCooldown())
 		return
 	}
@@ -1430,7 +1442,9 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 			tried := make(map[string]bool)
 			tried[acc.ID] = true
 			for {
-				s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
+				if !outbound.IsProxyIsolated(originalErr) {
+					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
+				}
 				if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 					s.accountPool.MarkImageLimited(acc.ID)
 				}
@@ -1462,7 +1476,9 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				// This account also failed; mark it and continue to the next
-				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+				if !outbound.IsProxyIsolated(err2) {
+					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+				}
 				if errors.Is(err2, chathub.ErrImageLimit) && s.accountPool != nil {
 					s.accountPool.MarkImageLimited(next.ID)
 				}
@@ -1475,7 +1491,9 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err != nil {
-			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+			if !outbound.IsProxyIsolated(err) {
+				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+			}
 			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
