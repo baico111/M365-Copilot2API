@@ -85,7 +85,8 @@ func ConfigureSingBox(subscriptionURL string) error {
 		return fmt.Errorf("sing-box: subscription returned 0 nodes")
 	}
 
-	if err := writeSingBoxConfig(cfg, nodes); err != nil {
+	selected, err := writeSingBoxConfig(cfg, nodes)
+	if err != nil {
 		return fmt.Errorf("sing-box: write config: %w", err)
 	}
 
@@ -97,6 +98,8 @@ func ConfigureSingBox(subscriptionURL string) error {
 	}
 	sbProcess = nil
 	sbClients = nil
+	sbNodeClients = nil
+	sbNodePorts = nil
 	sbMu.Unlock()
 
 	// Start sing-box
@@ -123,9 +126,9 @@ func ConfigureSingBox(subscriptionURL string) error {
 	}
 
 	// Build per-node clients (each port → specific exit IP)
-	nodeClients := make(map[int]*Clients, len(nodes))
-	nodePorts := make(map[int]int, len(nodes))
-	for i := range nodes {
+	nodeClients := make(map[int]*Clients, len(selected))
+	nodePorts := make(map[int]int, len(selected))
+	for i := range selected {
 		port := cfg.LocalPort + 1 + i
 		nodeClients[i] = buildLocalSOCKS5Clients(port)
 		nodePorts[i] = port
@@ -134,14 +137,14 @@ func ConfigureSingBox(subscriptionURL string) error {
 	sbMu.Lock()
 	sbConfig = cfg
 	sbProcess = cmd
-	sbNodeList = nodeNames(nodes)
+	sbNodeList = nodeNames(selected)
 	// Main clients (urltest auto-select) + per-node clients
 	sbClients = buildLocalSOCKS5Clients(cfg.LocalPort)
 	sbNodeClients = nodeClients
 	sbNodePorts = nodePorts
 	sbMu.Unlock()
 
-	log.Printf("[sing-box] started with %d nodes on port %d (per-node ports %d-%d)", len(nodes), cfg.LocalPort, cfg.LocalPort+1, cfg.LocalPort+len(nodes))
+	log.Printf("[sing-box] started with %d nodes on port %d (per-node ports %d-%d)", len(selected), cfg.LocalPort, cfg.LocalPort+1, cfg.LocalPort+len(selected))
 
 	// Wait for sing-box in background; restart on exit
 	go func() {
@@ -170,6 +173,9 @@ func stopSingBox() {
 		_ = sbProcess.Process.Kill()
 	}
 	sbProcess = nil
+	sbClients = nil
+	sbNodeClients = nil
+	sbNodePorts = nil
 }
 
 func refreshLoop(cfg *SingBoxConfig) {
@@ -184,8 +190,12 @@ func refreshLoop(cfg *SingBoxConfig) {
 		if len(nodes) == 0 {
 			continue
 		}
-		if err := writeSingBoxConfig(cfg, nodes); err != nil {
+		selected, err := writeSingBoxConfig(cfg, nodes)
+		if err != nil {
 			log.Printf("[sing-box] refresh write config failed: %v", err)
+			continue
+		}
+		if len(selected) == 0 {
 			continue
 		}
 		// Start new sing-box process FIRST, then kill old one
@@ -214,9 +224,9 @@ func refreshLoop(cfg *SingBoxConfig) {
 			continue
 		}
 		// Build per-node clients for the refreshed node set
-		nodeClients := make(map[int]*Clients, len(nodes))
-		nodePorts := make(map[int]int, len(nodes))
-		for i := range nodes {
+		nodeClients := make(map[int]*Clients, len(selected))
+		nodePorts := make(map[int]int, len(selected))
+		for i := range selected {
 			port := cfg.LocalPort + 1 + i
 			nodeClients[i] = buildLocalSOCKS5Clients(port)
 			nodePorts[i] = port
@@ -225,7 +235,7 @@ func refreshLoop(cfg *SingBoxConfig) {
 		sbMu.Lock()
 		oldCmd := sbProcess
 		sbProcess = reloadCmd
-		sbNodeList = nodeNames(nodes)
+		sbNodeList = nodeNames(selected)
 		sbClients = buildLocalSOCKS5Clients(cfg.LocalPort)
 		sbNodeClients = nodeClients
 		sbNodePorts = nodePorts
@@ -234,7 +244,7 @@ func refreshLoop(cfg *SingBoxConfig) {
 			_ = oldCmd.Process.Signal(os.Interrupt)
 			_ = oldCmd.Process.Kill()
 		}
-		log.Printf("[sing-box] refreshed with %d nodes", len(nodes))
+		log.Printf("[sing-box] refreshed with %d nodes", len(selected))
 		go func(c *exec.Cmd) {
 			err := c.Wait()
 			log.Printf("[sing-box] reloaded process exited: %v", err)
@@ -523,9 +533,11 @@ func nodeNames(nodes []vlessNode) []string {
 // gets its own local port so accounts can be distributed across IPs.
 const maxNodeInbounds = 50
 
-func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) error {
+// writeSingBoxConfig generates the sing-box config and returns the selected
+// node list so the caller can build matching per-node clients.
+func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) ([]vlessNode, error) {
 	if err := os.MkdirAll(cfg.ConfigDir, 0o755); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Use all nodes — sing-box urltest will auto-pick fastest.
@@ -633,9 +645,12 @@ func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) error {
 	configPath := filepath.Join(cfg.ConfigDir, "config.json")
 	b, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return os.WriteFile(configPath, b, 0o644)
+	if err := os.WriteFile(configPath, b, 0o644); err != nil {
+		return nil, err
+	}
+	return selected, nil
 }
 
 func selectRandomNodes(nodes []vlessNode, max int) []vlessNode {
