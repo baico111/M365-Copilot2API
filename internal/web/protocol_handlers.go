@@ -194,29 +194,56 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 				if v, ok := tc["type"].(string); ok && v == "custom" {
 					typ = "custom"
 				}
+				// Extract id and name from the current chunk BEFORE building
+				// the added event. The OpenAI Responses protocol requires
+				// call_id and name to be non-empty strings in the added
+				// event; emitting them empty causes clients (Codex/OpenCode)
+				// to reject with "Expected 'id' to be a string".
+				chunkID, _ := tc["id"].(string)
+				chunkFn, _ := tc["function"].(map[string]any)
+				chunkName, _ := chunkFn["name"].(string)
+				chunkArgs, _ := chunkFn["arguments"].(string)
 				if st == nil {
 					prefix := "fc_"
-					item := map[string]any{"type": "function_call", "call_id": "", "name": "", "arguments": "", "status": "in_progress"}
+					callID := chunkID
+					if callID == "" {
+						callID = "call_" + uuid.NewString()
+					}
+					name := chunkName
+					args := chunkArgs
 					if typ == "custom" {
 						prefix = "ctc_"
-						item = map[string]any{"type": "custom_tool_call", "call_id": "", "name": "", "input": "", "status": "in_progress"}
+						item := map[string]any{"type": "custom_tool_call", "call_id": callID, "name": name, "input": args, "status": "in_progress"}
+						st = &tcState{ItemID: prefix + uuid.NewString(), ID: callID, Name: name, Args: args, Type: typ}
+						calls[idx] = st
+						item["id"] = st.ItemID
+						emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
+					} else {
+						item := map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": "", "status": "in_progress"}
+						st = &tcState{ItemID: prefix + uuid.NewString(), ID: callID, Name: name, Args: args, Type: typ}
+						calls[idx] = st
+						item["id"] = st.ItemID
+						emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
+						// If the first chunk already carries arguments, emit them
+						// as a delta so conforming clients can reconstruct the
+						// full JSON (added only has an empty string).
+						if args != "" {
+							emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": args})
+						}
 					}
-					st = &tcState{ItemID: prefix + uuid.NewString(), Type: typ}
-					calls[idx] = st
-					item["id"] = st.ItemID
-					emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
-				}
-				if v, ok := tc["id"].(string); ok {
-					st.ID = v
-				}
-				fn, _ := tc["function"].(map[string]any)
-				if v, ok := fn["name"].(string); ok {
-					st.Name += v
-				}
-				if v, ok := fn["arguments"].(string); ok {
-					st.Args += v
-					if st.Type != "custom" {
-						emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": v})
+				} else {
+					// Subsequent delta for the same tool call
+					if chunkID != "" {
+						st.ID = chunkID
+					}
+					if chunkName != "" {
+						st.Name += chunkName
+					}
+					if chunkArgs != "" {
+						st.Args += chunkArgs
+						if st.Type != "custom" {
+							emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": chunkArgs})
+						}
 					}
 				}
 			}
