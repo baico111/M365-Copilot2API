@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -86,22 +87,33 @@ func ConfigureSingBox(subscriptionURL string) error {
 		return fmt.Errorf("sing-box: write config: %w", err)
 	}
 
-	// Stop existing process
+	// Stop existing process and clear stale clients
 	stopSingBox()
+	sbMu.Lock()
+	sbClients = nil
+	sbMu.Unlock()
 
 	// Start sing-box
 	cmd := exec.Command(cfg.BinaryPath, "run", "-c", filepath.Join(cfg.ConfigDir, "config.json"))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		// Try "run -c" fallback to just the config path
-		cmd2 := exec.Command(cfg.BinaryPath, "run", filepath.Join(cfg.ConfigDir, "config.json"))
-		cmd2.Stdout = os.Stdout
-		cmd2.Stderr = os.Stderr
-		if err2 := cmd2.Start(); err2 != nil {
-			return fmt.Errorf("sing-box: failed to start binary %q: %w (also tried without -c: %v)", cfg.BinaryPath, err, err2)
+		return fmt.Errorf("sing-box: failed to start binary %q: %w", cfg.BinaryPath, err)
+	}
+
+	// Wait briefly for sing-box to bind the local port
+	socksAddr := fmt.Sprintf("127.0.0.1:%d", cfg.LocalPort)
+	ready := false
+	for i := 0; i < 30; i++ {
+		if conn, err := net.Dial("tcp", socksAddr); err == nil {
+			conn.Close()
+			ready = true
+			break
 		}
-		cmd = cmd2
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !ready {
+		log.Printf("[sing-box] warning: local port %d not reachable after 6s, proceeding anyway", cfg.LocalPort)
 	}
 
 	sbMu.Lock()
@@ -235,13 +247,13 @@ func fetchSubscription(rawURL string) ([]vlessNode, error) {
 
 func parseSubscriptionBody(body string) ([]vlessNode, error) {
 	body = strings.TrimSpace(body)
-	// Try base64 decode first (common for subscription endpoints)
-	if decoded, err := base64.StdEncoding.DecodeString(body); err == nil {
-		body = string(decoded)
-	}
-	// Also try URL-safe base64
-	if decoded, err := base64.URLEncoding.DecodeString(body); err == nil {
-		body = string(decoded)
+	// Try base64 decode only if the body doesn't look like plain-text URIs
+	if !strings.Contains(body, "://") {
+		if decoded, err := base64.StdEncoding.DecodeString(body); err == nil && isPrintable(decoded) {
+			body = string(decoded)
+		} else if decoded, err := base64.URLEncoding.DecodeString(body); err == nil && isPrintable(decoded) {
+			body = string(decoded)
+		}
 	}
 
 	var nodes []vlessNode
@@ -404,45 +416,28 @@ func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) error {
 		return err
 	}
 
-	// Pick a random subset of nodes (up to 50) to rotate through
+	// Use all nodes — sing-box urltest will auto-pick fastest.
+	// We also shuffle so each restart rotates the order.
 	selected := selectRandomNodes(nodes, 50)
-
-	type outbound struct {
-		Tag   string `json:"tag"`
-		Type  string `json:"type"`
-		Server string `json:"server"`
-		ServerPort int `json:"server_port"`
-		UUID  string `json:"uuid,omitempty"`
-		Network string `json:"network,omitempty"`
-		TLS   *struct {
-			Enabled    bool   `json:"enabled"`
-			ServerName string `json:"server_name,omitempty"`
-		} `json:"tls,omitempty"`
-		WS *struct {
-			Path string `json:"path"`
-			Host string `json:"host,omitempty"`
-		} `json:"ws,omitempty"`
-	}
 
 	var outbounds []map[string]any
 
-	// selector outbound that randomly picks from nodes
 	var nodeTags []string
 	for i, n := range selected {
 		tag := fmt.Sprintf("node-%d", i)
 		nodeTags = append(nodeTags, tag)
 
 		ob := map[string]any{
-			"tag":          tag,
-			"type":         "vless",
-			"server":       n.Address,
-			"server_port":  n.Port,
-			"uuid":         n.UUID,
-			"network":      n.Network,
+			"tag":         tag,
+			"type":        "vless",
+			"server":      n.Address,
+			"server_port": n.Port,
+			"uuid":        n.UUID,
+			"network":     n.Network,
 		}
 		if n.TLS {
 			tlsConf := map[string]any{
-				"enabled":    true,
+				"enabled":     true,
 				"server_name": n.SNI,
 			}
 			if n.FP != "" {
@@ -465,14 +460,17 @@ func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) error {
 		outbounds = append(outbounds, ob)
 	}
 
-	// selector with random strategy
-	selectorOut := map[string]any{
-		"tag":      "proxy",
-		"type":     "selector",
-		"outbounds": nodeTags,
-		"default":  nodeTags[0],
+	// urltest: auto-select lowest latency node (sing-box built-in)
+	urltestOut := map[string]any{
+		"tag":           "proxy",
+		"type":          "urltest",
+		"outbounds":     nodeTags,
+		"url":           "https://www.gstatic.com/generate_204",
+		"interval":      "5m",
+		"tolerance":     50,
+		"idle_timeout":  "30m",
 	}
-	outbounds = append(outbounds, selectorOut)
+	outbounds = append(outbounds, urltestOut)
 
 	// direct + block
 	outbounds = append(outbounds, map[string]any{"tag": "direct", "type": "direct"})
@@ -480,17 +478,16 @@ func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) error {
 
 	// inbound: mixed (socks5 + http) on local port
 	inbound := map[string]any{
-		"tag":  "mixed-in",
-		"type": "mixed",
-		"listen": "127.0.0.1",
+		"tag":         "mixed-in",
+		"type":        "mixed",
+		"listen":      "127.0.0.1",
 		"listen_port": cfg.LocalPort,
 	}
 
-	// route
+	// route: default goes through proxy
 	route := map[string]any{
-		"outbounds": map[string]any{
-			"default": "proxy",
-		},
+		"outbound": "proxy",
+		"final":    "proxy",
 	}
 
 	config := map[string]any{
@@ -563,6 +560,21 @@ func OverrideClients(c *Clients) {
 	clientsMu.Lock()
 	clients = c
 	clientsMu.Unlock()
+}
+
+// isPrintable reports whether a byte slice is mostly printable ASCII,
+// used to validate that a base64 decode produced sensible output.
+func isPrintable(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	printable := 0
+	for _, c := range b {
+		if c >= 32 && c < 127 || c == '\n' || c == '\r' || c == '\t' {
+			printable++
+		}
+	}
+	return printable*100/len(b) > 90
 }
 
 // strconvAtoi is a local helper to avoid importing strconv.
