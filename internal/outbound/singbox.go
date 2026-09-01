@@ -88,8 +88,12 @@ func ConfigureSingBox(subscriptionURL string) error {
 	}
 
 	// Stop existing process and clear stale clients
-	stopSingBox()
 	sbMu.Lock()
+	if sbProcess != nil && sbProcess.Process != nil {
+		_ = sbProcess.Process.Signal(os.Interrupt)
+		_ = sbProcess.Process.Kill()
+	}
+	sbProcess = nil
 	sbClients = nil
 	sbMu.Unlock()
 
@@ -171,23 +175,41 @@ func refreshLoop(cfg *SingBoxConfig) {
 			log.Printf("[sing-box] refresh write config failed: %v", err)
 			continue
 		}
-		// Reload sing-box
+		// Start new sing-box process FIRST, then kill old one
+		// This avoids a window where no proxy is available.
 		reloadCmd := exec.Command(cfg.BinaryPath, "run", "-c", filepath.Join(cfg.ConfigDir, "config.json"))
 		reloadCmd.Stdout = os.Stdout
 		reloadCmd.Stderr = os.Stderr
-		sbMu.Lock()
-		// Stop old process
-		if sbProcess != nil && sbProcess.Process != nil {
-			_ = sbProcess.Process.Signal(os.Interrupt)
-		}
 		if err := reloadCmd.Start(); err != nil {
-			log.Printf("[sing-box] reload failed: %v", err)
-			sbMu.Unlock()
+			log.Printf("[sing-box] reload failed (old process kept): %v", err)
 			continue
 		}
+		// Wait briefly for new process to bind the port
+		socksAddr := fmt.Sprintf("127.0.0.1:%d", cfg.LocalPort)
+		ready := false
+		for i := 0; i < 30; i++ {
+			if conn, err := net.Dial("tcp", socksAddr); err == nil {
+				conn.Close()
+				ready = true
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		if !ready {
+			log.Printf("[sing-box] reload: port %d not reachable, keeping old process", cfg.LocalPort)
+			_ = reloadCmd.Process.Kill()
+			continue
+		}
+		// New process is ready — kill old one
+		sbMu.Lock()
+		oldCmd := sbProcess
 		sbProcess = reloadCmd
 		sbNodeList = nodeNames(nodes)
 		sbMu.Unlock()
+		if oldCmd != nil && oldCmd.Process != nil {
+			_ = oldCmd.Process.Signal(os.Interrupt)
+			_ = oldCmd.Process.Kill()
+		}
 		log.Printf("[sing-box] refreshed with %d nodes", len(nodes))
 		go func(c *exec.Cmd) {
 			err := c.Wait()
