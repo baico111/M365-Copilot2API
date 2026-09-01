@@ -535,10 +535,9 @@ if (response.output_text) {
                 <button data-f="cooldown" onclick="setAccountFilter('cooldown')">Cooldown</button>
                 <button data-f="offline" onclick="setAccountFilter('offline')">Offline</button>
               </div>
-              <button class="btn primary" id="probeAllBtn" onclick="probeAllAccounts()" style="white-space:nowrap"><i data-lucide="zap" style="width:14px;height:14px"></i> Probe all</button>
             </div>
           </div>
-          <table class="table"><thead><tr><th>Account</th><th>Calls</th><th>Status</th><th>Reason</th><th>Updated</th><th>Scheduling</th><th>Proxy</th><th>Actions</th></tr></thead><tbody id="accountRows"><tr><td colspan="8" class="empty">Loading...</td></tr></tbody></table>
+          <table class="table"><thead><tr><th>Account</th><th>Calls</th><th>Status</th><th>Updated</th><th>Scheduling</th><th>Proxy</th><th>Actions</th></tr></thead><tbody id="accountRows"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody></table>
         </div>
       </section>
 
@@ -577,28 +576,30 @@ if (response.output_text) {
       </section>
 
       <!-- Proxies -->
-      <section id="page-proxies" style="display:none">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-          <div><h2 style="font-size:18px;font-weight:700">Proxy pool</h2><p style="font-size:12px;color:var(--muted);margin-top:2px">Configure outbound proxies with http / https / socks5 and automatic failover</p></div>
-          <button class="btn" onclick="proxyCheckAll()"><i data-lucide="activity" style="width:14px;height:14px"></i> Check all</button>
-        </div>
-        <div class="card" style="margin-bottom:16px">
-          <div class="card-head"><span class="card-title">Add proxy</span></div>
-          <div class="card-body">
-            <label class="form-label">Proxy URLs (one per line; bulk paste supported)</label>
-            <textarea class="form-input" id="proxyInput" rows="4" placeholder="http://user:pass@host:port&#10;socks5://127.0.0.1:1080&#10;https://proxy.example.com:443"></textarea>
-            <div style="margin-top:12px;display:flex;gap:8px">
-              <button class="btn primary" onclick="proxyAdd()"><i data-lucide="plus" style="width:14px;height:14px"></i> Add</button>
-              <button class="btn" onclick="proxyTest()">Test connectivity</button>
-            </div>
-            <p class="form-hint" style="margin-top:8px">Supported formats: <code>http://</code>, <code>https://</code>, and <code>socks5://</code>; usernames and passwords are supported</p>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-head"><span class="card-title">Proxy list</span></div>
-          <table class="table"><thead><tr><th>URL</th><th>Status</th><th>Latency</th><th>Failures</th><th>Cooldown until</th><th>Actions</th></tr></thead><tbody id="proxyRows"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody></table>
-        </div>
-      </section>
+<section id="page-proxies" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+<div><h2 style="font-size:18px;font-weight:700">Sing-box Proxy</h2><p style="font-size:12px;color:var(--muted);margin-top:2px">通过订阅地址自动获取节点，sing-box urltest 自动优选最快节点</p></div>
+<button class="btn" onclick="loadProxies()"><i data-lucide="refresh-cw" style="width:14px;height:14px"></i> 刷新</button>
+</div>
+<div class="card" style="margin-bottom:16px">
+<div class="card-head"><span class="card-title">订阅地址</span></div>
+<div class="card-body">
+<label class="form-label">Subscription URL (VLESS / VMess / SS 订阅链接)</label>
+<textarea class="form-input" id="proxyInput" rows="3" placeholder="https://example.com/sub?token=xxx"></textarea>
+<div style="margin-top:12px;display:flex;gap:8px">
+<button class="btn primary" onclick="proxyAdd()"><i data-lucide="rocket" style="width:14px;height:14px"></i> 启动代理</button>
+<button class="btn danger" onclick="proxyStop()"><i data-lucide="square" style="width:14px;height:14px"></i> 停止代理</button>
+</div>
+<p class="form-hint" style="margin-top:8px">支持 VLESS / VMess / SS 订阅链接，sing-box 会自动拉取节点并通过 <code>urltest</code> 选择最快节点</p>
+</div>
+</div>
+<div class="card">
+<div class="card-head"><span class="card-title">节点列表</span></div>
+<div id="proxyStatus" style="padding:16px">
+<div class="empty" style="text-align:center;padding:24px">Loading...</div>
+</div>
+</div>
+</section>
 
       <!-- Model Test -->
       <section id="page-modeltest" style="display:none">
@@ -1081,17 +1082,15 @@ function renderAccounts(){
     const calls=x.rateLimited?`Limited after ${x.callCount||0} calls`:`Called ${x.callCount||0} times`;
     const scheduleEnabled=x.scheduleEnabled!==false;
     const proxyLabel=x.boundProxy?`<span style="font-size:11px;word-break:break-all">${esc(x.boundProxy)}</span>`:'<span style="color:var(--muted);font-size:11px">—</span>';
-    const reason=x.authFailReason?`<span style="font-size:11px;color:var(--red)">${esc(x.authFailReason)}</span>`:(x.cooldownUntil?'<span style="font-size:11px;color:#d97706">cooldown</span>':'<span style="color:var(--muted);font-size:11px">—</span>');
-    const forceOnline=(x.status==='cooldown'||x.status==='offline'||x.authFailReason)?`<button class="btn-sm btn success" onclick="forceOnlineAccount('${x.id}')" style="margin-right:4px">Online</button>`:'';
-    return `<tr><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div></div></div></td><td style="font-size:12px;white-space:nowrap">${calls}</td><td>${status}</td><td>${reason}</td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><button class="btn-sm btn${scheduleEnabled?'':' danger'}" onclick="toggleAccountSchedule('${x.id}',${!scheduleEnabled})">${scheduleEnabled?'Enabled':'Disabled'}</button></td><td>${proxyLabel} <button class="btn-sm btn" style="margin-top:2px" onclick="bindAccountProxy('${x.id}','${esc(x.boundProxy||'')}')">Bind</button></td><td style="white-space:nowrap">${forceOnline}<button class="btn-sm btn" onclick="probeOneAccount('${x.id}')" style="margin-right:4px">Probe</button><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></td></tr>`;
-  }).join(''):'<tr><td colspan="8" class="empty">No matching accounts</td></tr>';
+    return `<tr><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div></div></div></td><td style="font-size:12px;white-space:nowrap">${calls}</td><td>${status}</td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><button class="btn-sm btn${scheduleEnabled?'':' danger'}" onclick="toggleAccountSchedule('${x.id}',${!scheduleEnabled})">${scheduleEnabled?'Enabled':'Disabled'}</button></td><td>${proxyLabel} <button class="btn-sm btn" style="margin-top:2px" onclick="bindAccountProxy('${x.id}','${esc(x.boundProxy||'')}')">Bind</button></td><td><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></td></tr>`;
+  }).join(''):'<tr><td colspan="7" class="empty">No matching accounts</td></tr>';
 }
 async function loadAccounts(){
   try{
     const d=await api('/api/accounts');
     _accountsCache=d.accounts||[];
     renderAccounts();
-  }catch(e){$('accountRows').innerHTML=`<tr><td colspan="8" class="empty">${e.message}</td></tr>`;}
+  }catch(e){$('accountRows').innerHTML=`<tr><td colspan="7" class="empty">${e.message}</td></tr>`;}
 }
 
 async function toggleAccountSchedule(id,enabled){
@@ -1113,44 +1112,6 @@ function bindAccountProxy(id,current){
   const url=prompt('Bind proxy for this account (socks5://, http://, https://). Leave empty to unbind:',current||'');
   if(url===null)return;
   api('/api/accounts/bind-proxy',{method:'POST',body:JSON.stringify({id,proxyUrl:url.trim()})}).then(()=>{showNotice(url.trim()?'Proxy bound':'Proxy unbound','success');loadAccounts();}).catch(e=>showNotice(e.message,'error'));
-}
-
-async function probeOneAccount(id){
-  showNotice('Probing account...','');
-  try{
-    const d=await api('/api/accounts/probe',{method:'POST',body:JSON.stringify({id})});
-    const r=d.result;
-    if(r.alive){
-      showNotice(`✅ ${r.email||r.id} is alive (${r.latencyMs}ms)`,'success');
-    }else{
-      const reason=r.errorReason||r.errorCategory||'unknown';
-      showNotice(`❌ ${r.email||r.id} offline: ${reason}`,'error');
-    }
-    loadAccounts();
-  }catch(e){showNotice(e.message,'error');}
-}
-
-async function forceOnlineAccount(id){
-  try{
-    await api('/api/accounts/clear-cooldown',{method:'POST',body:JSON.stringify({id})});
-    showNotice('Account forced online','success');
-    loadAccounts();
-  }catch(e){showNotice(e.message,'error');}
-}
-
-async function probeAllAccounts(){
-  const btn=$('probeAllBtn');
-  btn.disabled=true;btn.innerHTML='<span style="opacity:0.7">Probing...</span>';
-  showNotice('Probing all accounts, please wait...','');
-  try{
-    const d=await api('/api/accounts/probe',{method:'POST',body:JSON.stringify({all:true})});
-    const results=d.results||[];
-    const alive=d.alive||0;
-    const total=d.total||results.length;
-    showNotice(`Probe complete: ${alive}/${total} alive`,'success');
-    loadAccounts();
-  }catch(e){showNotice(e.message,'error');}
-  finally{btn.disabled=false;btn.innerHTML='<i data-lucide="zap" style="width:14px;height:14px"></i> Probe all';lucide.createIcons();}
 }
 
 async function startPKCE(){
@@ -1520,67 +1481,44 @@ async function cleanupAll(){
   showNotice('清理完成','success');loadConversations();
 }
 
-function proxyRow(x){
-  const inCooldown=x.cooldownUntil&&new Date(x.cooldownUntil)>new Date();
-  const badge=x.health==='reachable'?'<span class="status online"><i></i>Healthy</span>':x.health==='unreachable'?'<span class="status offline"><i></i>Unreachable</span>':x.health==='upstream_error'?'<span class="status warn"><i></i>Upstream error</span>':'<span class="status">Not checked</span>';
-  return `<tr>
-    <td><code style="font-size:12px">${esc(x.url)}</code>${inCooldown?'<div style="font-size:11px;color:var(--muted)">Cooling down</div>':''}</td>
-    <td>${badge}</td>
-    <td style="font-size:12px;color:var(--muted)">${x.latencyMs>0?x.latencyMs+' ms':'-'}</td>
-    <td style="font-size:12px;color:var(--muted)">${x.failures||0}</td>
-    <td style="font-size:12px;color:var(--muted)">${x.cooldownUntil?new Date(x.cooldownUntil).toLocaleString():'-'}</td>
-    <td style="text-align:right;white-space:nowrap">
-      <button class="btn-sm btn" onclick="proxyCheckOne('${esc(x.url)}')">检测</button>
-      <button class="btn-sm btn danger" onclick="proxyRemove('${esc(x.url)}')">Delete</button>
-    </td>
-  </tr>`;
-}
 async function loadProxies(){
   try{
     const d=await api('/api/admin/proxy-pool');
     const p=d.proxies||[];
-    $('proxyRows').innerHTML=p.length?p.map(proxyRow).join(''):'<tr><td colspan="6" class="empty">No proxies; requests will connect directly</td></tr>';
-  }catch(e){$('proxyRows').innerHTML=`<tr><td colspan="6" class="empty">${e.message}</td></tr>`;}
+    if(!p.length){
+      $('proxyStatus').innerHTML='<div class="empty" style="text-align:center;padding:24px">未启动代理，请求将直连</div>';
+      return;
+    }
+    const info=p[0];
+    const nodes=info.nodes||[];
+    const nodeHtml=nodes.length?nodes.map((n,i)=>`<div style="display:inline-block;margin:2px;padding:2px 10px;background:var(--bg-alt);border-radius:4px;font-size:12px">${esc(n)}</div>`).join(''):'';
+    $('proxyStatus').innerHTML=`
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+        <div><span style="color:var(--muted);font-size:12px">状态</span><br><span class="status online"><i></i>运行中</span></div>
+        <div><span style="color:var(--muted);font-size:12px">节点数量</span><br><span style="font-size:18px;font-weight:700">${info.node_count||0}</span></div>
+        <div><span style="color:var(--muted);font-size:12px">本地端口</span><br><code>${info.local_port||'-'}</code></div>
+        <div><span style="color:var(--muted);font-size:12px">订阅地址</span><br><code style="word-break:break-all;font-size:11px">${esc(info.subscription||'-')}</code></div>
+      </div>
+      <div style="margin-top:12px">
+        <span style="color:var(--muted);font-size:12px">节点列表 (${nodes.length})</span>
+        <div style="margin-top:8px">${nodeHtml||'<span style="color:var(--muted)">无</span>'}</div>
+      </div>`;
+  }catch(e){$('proxyStatus').innerHTML='<div class="empty" style="text-align:center;padding:24px;color:var(--danger)">'+e.message+'</div>';}
 }
 async function proxyAdd(){
   const raw=$('proxyInput').value.trim();
-  if(!raw)return showNotice('请输入代理地址','error');
+  if(!raw)return showNotice('请输入订阅地址','error');
   try{
-    const d=await api('/api/admin/proxy-pool',{method:'POST',body:JSON.stringify({urls:[raw]})});
-    showNotice('Added '+d.added+' proxies','success');$('proxyInput').value='';loadProxies();
+    showNotice('正在拉取订阅并启动 sing-box...','info');
+    const d=await api('/api/admin/proxy-pool',{method:'POST',body:JSON.stringify({subscription:raw})});
+    const nc=(d.proxies&&d.proxies[0]&&d.proxies[0].node_count)||0;
+    showNotice('sing-box 已启动，共 '+nc+' 个节点','success');$('proxyInput').value='';loadProxies();
   }catch(e){showNotice(e.message,'error');}
 }
-async function proxyRemove(url){
-  if(!confirm('确定删除代理 '+url+'？'))return;
-  try{await api('/api/admin/proxy-pool?url='+encodeURIComponent(url),{method:'DELETE'});showNotice('已删除','success');loadProxies();}
+async function proxyStop(){
+  if(!confirm('确定停止 sing-box 代理？'))return;
+  try{await api('/api/admin/proxy-pool',{method:'DELETE'});showNotice('sing-box 已停止','success');loadProxies();}
   catch(e){showNotice(e.message,'error');}
-}
-async function proxyCheckOne(url){
-  try{
-    const d=await api('/api/admin/proxy-pool?action=check',{method:'PUT',body:JSON.stringify({url})});
-    const rec=(d.proxies||[]).find(x=>x.url===url);
-    if(rec&&rec.health==='reachable')showNotice('Connection healthy: '+rec.latencyMs+' ms','success');
-    else showNotice(rec&&rec.lastError?rec.lastError:'连接失败','error');
-    loadProxies();
-  }catch(e){showNotice(e.message,'error');}
-}
-async function proxyCheckAll(){
-  termOpen('proxy check — m365-copilot2api');
-  termLine('正在检测所有代理…');
-  try{
-    const d=await api('/api/admin/proxy-pool?action=check',{method:'PUT'});
-    const p=d.proxies||[];
-    let ok=0;
-    for(const x of p){
-      if(x.health==='reachable'){termLine('✓ '+x.url+' — '+x.latencyMs+' ms','ok');ok++;}
-      else termLine('✗ '+x.url+(x.lastError?' — '+x.lastError:''),'err');
-    }
-    termLine('Finished: '+ok+'/'+p.length+' proxies available.',ok===p.length&&p.length?'ok':'warn');
-    showNotice('健康检查完成','success');loadProxies();
-  }catch(e){termLine('Check failed: '+e.message,'err');}
-}
-async function proxyTest(){
-  await proxyCheckAll();
 }
 
 async function loadModelTest(){
