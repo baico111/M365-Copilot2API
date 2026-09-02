@@ -350,6 +350,17 @@ func (c *Client) ChatWithReasoning(ctx context.Context, acc Account, req Request
 }
 
 func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request, onDelta func(string) error, onEvent StreamHandler) (Result, error) {
+	return c.chatWithHandlersDepth(ctx, acc, req, onDelta, onEvent, 0)
+}
+
+// maxAutoContinue limits how many times we auto-continue an incomplete
+// response to avoid infinite loops. Each continue gets its own 10-minute
+// deadline, so 2 continues = up to 30 minutes total.
+const maxAutoContinue = 2
+
+// chatWithHandlersDepth is the core implementation with a depth counter
+// to limit recursive auto-continue calls.
+func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Request, onDelta func(string) error, onEvent StreamHandler, depth int) (Result, error) {
 	startedAt := time.Now()
 	log.Printf("chathub timing start prompt_len=%d", len(req.Text))
 	if acc.AccessToken == "" || acc.OID == "" || acc.TID == "" {
@@ -1092,14 +1103,68 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 
 	// Reaching the overall deadline without a SignalR completion frame is
-	// an incomplete upstream response. However, if we already have
-	// streamed text, return it as a partial result so streaming clients
-	// receive the content they already saw instead of a hard failure.
-	// The finalizeText call below reconciles streamed vs final (which is
-	// empty here, so streamed text is kept as-is).
+	// an incomplete upstream response. If we already have streamed text,
+	// automatically send a "continue" request using the same conversation
+	// context so the upstream finishes the answer. This is transparent to
+	// the client: the SSE stream stays open and deltas keep flowing.
 	streamedText := streamed.String()
-	if streamedText != "" {
-		log.Printf("[chathub] deadline exceeded with %d bytes of streamed text; returning partial result", len(streamedText))
+	if streamedText != "" && depth < maxAutoContinue {
+		log.Printf("[chathub] deadline exceeded with %d bytes streamed; attempting auto-continue (depth=%d)", len(streamedText), depth)
+		returnConn = false
+		// Build a continue request reusing the same conversation/session.
+		continueReq := req
+		continueReq.Text = "请继续刚才未完成的回答，直接从你中断的地方继续，不要重复已说的内容。"
+		continueReq.Started = false
+		continueReq.ConversationID = req.ConversationID
+		continueReq.SessionID = req.SessionID
+		// Create a fresh context for the continue request so it gets a
+		// full deadline, not the remains of the parent's exhausted one.
+		continueCtx, continueCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer continueCancel()
+		// The second call gets its own deadline; onDelta is the same
+		// callback so streamed content flows to the client seamlessly.
+		continueResult, continueErr := c.chatWithHandlersDepth(continueCtx, acc, continueReq, onDelta, onEvent, depth+1)
+		if continueErr == nil && continueResult.Text != "" {
+			// Combine: original streamed text + continuation text.
+			combined := streamedText + continueResult.Text
+			return Result{
+				Text:                       combined,
+				Reasoning:                  reasoningBuf.String() + continueResult.Reasoning,
+				ConversationID:             continueResult.ConversationID,
+				SessionID:                  continueResult.SessionID,
+				RequestID:                  continueResult.RequestID,
+				Throttling:                 continueResult.Throttling,
+				SuggestedResponses:         continueResult.SuggestedResponses,
+				Offense:                    continueResult.Offense,
+				Scores:                     continueResult.Scores,
+				ConversationTransferToken:  continueResult.ConversationTransferToken,
+				MeteringInformation:        continueResult.MeteringInformation,
+				SpokenText:                 continueResult.SpokenText,
+				StorageMessageID:           continueResult.StorageMessageID,
+				References:                 references,
+				RawResult:                  continueResult.RawResult,
+				Events:                     append(events, continueResult.Events...),
+				Normalized:                 NormalizeEvents(append(events, continueResult.Events...)),
+				Images:                     continueResult.Images,
+				Timestamps:                 ts,
+			}, nil
+		}
+		// Continue failed — return what we have as partial result.
+		if continueErr != nil {
+			log.Printf("[chathub] auto-continue failed (depth=%d): %v; returning partial result (%d bytes)", depth, continueErr, len(streamedText))
+		} else {
+			log.Printf("[chathub] auto-continue returned empty (depth=%d); returning partial result (%d bytes)", depth, len(streamedText))
+		}
+		return Result{
+			Text:       streamedText,
+			Reasoning:  reasoningBuf.String(),
+			Events:     events,
+			Normalized: NormalizeEvents(events),
+			Timestamps: ts,
+		}, nil
+	}
+	if streamedText != "" && depth >= maxAutoContinue {
+		log.Printf("[chathub] max auto-continue depth reached (%d); returning partial result (%d bytes)", depth, len(streamedText))
 		returnConn = false
 		return Result{
 			Text:       streamedText,
