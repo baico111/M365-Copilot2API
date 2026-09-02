@@ -2303,127 +2303,56 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err != nil {
-			// ---- Mid-stream proxy failure recovery ----
-			// When a proxy drops mid-stream but text was already streamed,
-			// try switching to a different account (which may use a different
-			// sing-box node) and send a "continue" request so the new
-			// connection picks up where the old one left off. The SSE stream
-			// stays open the whole time — the client sees seamless text.
-			if text.Len() > 0 && outbound.IsProxyIsolated(err) && body.AccountID == "" {
-				log.Printf("[req-trace] id=%s stage=stream_proxy_failover text=%d err=%v", requestID, text.Len(), err)
-				// Try up to 2 different accounts to continue the response
-				triedAccounts := map[string]bool{acc.ID: true}
-				for attempt := 0; attempt < 2; attempt++ {
-					next, nerr := s.nextHealthyAccountMulti(triedAccounts)
-					if nerr != nil {
-						break
-					}
-					triedAccounts[next.ID] = true
-					// Build a continue request: ask the model to continue
-					// from where it left off, reusing the conversation context.
-					continueReq := answerReq
-					continueReq.Text = "请继续刚才未完成的回答，直接从你中断的地方继续，不要重复已说的内容。"
-					continueReq.Started = false
-					// Use the conversation ID from the original response if available
-					if res.ConversationID != "" {
-						continueReq.ConversationID = res.ConversationID
-						continueReq.SessionID = res.SessionID
-					} else if body.ConversationID != "" {
-						continueReq.ConversationID = body.ConversationID
-						continueReq.SessionID = body.SessionID
-					}
-					ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-					res2, err2 := s.chatWithAccountEvents(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, continueReq, func(ev chathub.StreamEvent) error {
-						if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
-							streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
-							return nil
-						}
-						if ev.Kind != "text" || ev.Text == "" {
-							return nil
-						}
-						text.WriteString(ev.Text)
-						pending.WriteString(ev.Text)
-						v := pending.String()
-						if runeCount := utf8.RuneCountInString(v); runeCount > 3 {
-							cut := 0
-							seen := 0
-							for i := range v {
-								if seen == runeCount-3 {
-									cut = i
-									break
-								}
-								seen++
-							}
-							if err := emitText(v[:cut]); err != nil {
-								return err
-							}
-							pending.Reset()
-							pending.WriteString(v[cut:])
-						}
-						return nil
-					})
-					cancel2()
-					if err2 == nil && (text.Len() > 0 || len(streamedTools) > 0) {
-						// Success: merge results and continue
-						s.accountPool.MarkSuccess(next.ID)
-						res = res2
-						acc = next
-						err = nil
-						break
-					}
-					if err2 != nil && !outbound.IsProxyIsolated(err2) {
-						s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
-					}
-				}
-			}
-			// ---- End mid-stream proxy failure recovery ----
-
-			if err != nil {
-				// If we already streamed text and can't recover, close the SSE
-				// stream normally with finish_reason="stop" instead of error.
-				if text.Len() > 0 || len(streamedTools) > 0 {
-					log.Printf("[req-trace] id=%s stage=stream_partial_complete text=%d tools=%d err=%v", requestID, text.Len(), len(streamedTools), err)
-					if !outbound.IsProxyIsolated(err) {
-						s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
-					}
-					if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(acc.ID)
-					}
-					// Emit any remaining buffered text
-					if pending.Len() > 0 {
-						_ = emitText(pending.String())
-					}
-					finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
-					_ = sw.data(mustJSON(finishChunk))
-					_ = sw.data("[DONE]")
-					if body.User != "" && res.ConversationID != "" {
-						s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
-					}
-					s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
-					return
-				}
-				log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
+			// If we already streamed text, close the SSE stream normally
+			// with finish_reason="stop" instead of sending an error.
+			// The chathub layer already attempted transport-level retry
+			// (before any text was streamed) and auto-continue (after
+			// text was streamed), so at this point the error is
+			// unrecoverable. Sending the partial text as a complete
+			// response is the best user experience — the client sees
+			// what was generated rather than a blank error.
+			if text.Len() > 0 || len(streamedTools) > 0 {
+				log.Printf("[req-trace] id=%s stage=stream_partial_complete text=%d tools=%d err=%v", requestID, text.Len(), len(streamedTools), err)
 				if !outbound.IsProxyIsolated(err) {
-						s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+					s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 				}
 				if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 					s.accountPool.MarkImageLimited(acc.ID)
 				}
-				if convReused {
-					s.invalidateConvCache(convCacheSessionKey, acc.ID, convCacheModel)
+				// Emit any remaining buffered text
+				if pending.Len() > 0 {
+					_ = emitText(pending.String())
 				}
-				msg := upstreamError(err)
-				if IsRateLimited(err) {
-					msg = "upstream is rate limiting; try again shortly"
+				finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
+				_ = sw.data(mustJSON(finishChunk))
+				_ = sw.data("[DONE]")
+				if body.User != "" && res.ConversationID != "" {
+					s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
 				}
-				if errors.Is(err, chathub.ErrOffensiveContent) {
-					msg = "M365 content policy flagged this request as offensive"
-				}
-				msg = sanitizePublicInternalText(msg)
-				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
-				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+				s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
 				return
 			}
+			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
+			if !outbound.IsProxyIsolated(err) {
+				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+			}
+			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+				s.accountPool.MarkImageLimited(acc.ID)
+			}
+			if convReused {
+				s.invalidateConvCache(convCacheSessionKey, acc.ID, convCacheModel)
+			}
+			msg := upstreamError(err)
+			if IsRateLimited(err) {
+				msg = "upstream is rate limiting; try again shortly"
+			}
+			if errors.Is(err, chathub.ErrOffensiveContent) {
+				msg = "M365 content policy flagged this request as offensive"
+			}
+			msg = sanitizePublicInternalText(msg)
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
+			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+			return
 		}
 		s.accountPool.MarkSuccess(acc.ID)
 		if res.Throttling != nil && s.accountPool != nil {
@@ -2749,82 +2678,46 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				}
 			}
 	} else {
-		// ---- Mid-stream proxy failure recovery (reasoning path) ----
-		if streamedReasoningLen > 0 && outbound.IsProxyIsolated(err) && body.AccountID == "" {
-			log.Printf("[req-trace] id=%s stage=stream_proxy_failover_reasoning reasoning=%d err=%v", requestID, streamedReasoningLen, err)
-			triedAccounts := map[string]bool{acc.ID: true}
-			for attempt := 0; attempt < 2; attempt++ {
-				next, nerr := s.nextHealthyAccountMulti(triedAccounts)
-				if nerr != nil {
-					break
-				}
-				triedAccounts[next.ID] = true
-				continueReq := answerReq
-				continueReq.Text = "请继续刚才未完成的回答，直接从你中断的地方继续，不要重复已说的内容。"
-				continueReq.Started = false
-				if res.ConversationID != "" {
-					continueReq.ConversationID = res.ConversationID
-					continueReq.SessionID = res.SessionID
-				} else if body.ConversationID != "" {
-					continueReq.ConversationID = body.ConversationID
-					continueReq.SessionID = body.SessionID
-				}
-				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-				res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, continueReq, onDeltaWrapped, onReasoningWrapped)
-				cancel2()
-				if err2 == nil {
-					s.accountPool.MarkSuccess(next.ID)
-					res = res2
-					acc = next
-					err = nil
-					break
-				}
-				if !outbound.IsProxyIsolated(err2) {
-					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
-				}
+		// If we already streamed reasoning or text, treat this as a
+		// successful (but incomplete) response with finish_reason="stop"
+		// instead of sending an error to the client.
+		// The chathub layer already attempted transport-level retry
+		// (before any text was streamed) and auto-continue (after
+		// text was streamed), so at this point the error is unrecoverable.
+		if streamedReasoningLen > 0 {
+			log.Printf("[req-trace] id=%s stage=stream_partial_complete reasoning=%d err=%v", requestID, streamedReasoningLen, err)
+			if !outbound.IsProxyIsolated(err) {
+				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
 			}
-		}
-		// ---- End mid-stream proxy failure recovery ----
-
-		if err != nil {
-			// If we already streamed reasoning or text, treat this as a
-			// successful (but incomplete) response with finish_reason="stop"
-			// instead of sending an error to the client.
-			if streamedReasoningLen > 0 {
-				log.Printf("[req-trace] id=%s stage=stream_partial_complete reasoning=%d err=%v", requestID, streamedReasoningLen, err)
-				if !outbound.IsProxyIsolated(err) {
-					s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
-				}
-				if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
-					s.accountPool.MarkImageLimited(acc.ID)
-				}
-				if content := contentFilter.Flush(); content != "" {
-					_ = writeChunk(map[string]any{"content": content})
-				}
-				if reasoning := reasoningFilter.Flush(); reasoning != "" {
-					_ = writeChunk(map[string]any{"reasoning_content": reasoning})
-				}
-			} else {
-				log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
-				if !outbound.IsProxyIsolated(err) {
-					s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
-				}
-				if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
-					s.accountPool.MarkImageLimited(acc.ID)
-				}
-				if convReused {
-					s.invalidateConvCache(convCacheSessionKey, acc.ID, convCacheModel)
-				}
-				msg := upstreamError(err)
-				if IsRateLimited(err) {
-					msg = "upstream is rate limiting; try again shortly"
-				}
-				if errors.Is(err, chathub.ErrOffensiveContent) {
-					msg = "M365 content policy flagged this request as offensive"
-				}
-				msg = sanitizePublicInternalText(msg)
-				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
+			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+				s.accountPool.MarkImageLimited(acc.ID)
 			}
+			if content := contentFilter.Flush(); content != "" {
+				_ = writeChunk(map[string]any{"content": content})
+			}
+			if reasoning := reasoningFilter.Flush(); reasoning != "" {
+				_ = writeChunk(map[string]any{"reasoning_content": reasoning})
+			}
+		} else {
+			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
+			if !outbound.IsProxyIsolated(err) {
+				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+			}
+			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+				s.accountPool.MarkImageLimited(acc.ID)
+			}
+			if convReused {
+				s.invalidateConvCache(convCacheSessionKey, acc.ID, convCacheModel)
+			}
+			msg := upstreamError(err)
+			if IsRateLimited(err) {
+				msg = "upstream is rate limiting; try again shortly"
+			}
+			if errors.Is(err, chathub.ErrOffensiveContent) {
+				msg = "M365 content policy flagged this request as offensive"
+			}
+			msg = sanitizePublicInternalText(msg)
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
 		}
 	}
 	pt := EstimateTokens(prompt)

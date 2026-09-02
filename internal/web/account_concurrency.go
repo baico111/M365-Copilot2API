@@ -2,10 +2,12 @@ package web
 
 import (
 	"context"
+	"log"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"m365-copilot2api/internal/chathub"
 	"m365-copilot2api/internal/outbound"
@@ -156,10 +158,71 @@ func (s *Server) chatWithAccount(ctx context.Context, accountID string, account 
 	}
 	result, err := s.accountClient(accountID).Chat(ctx, account, request)
 	s.markAccountResult(accountID, err)
+
+	// Transport-level retry for non-streaming requests. Since there is
+	// no streaming callback, there is no risk of duplicate content.
+	// Retry any transport-level error with a different account.
+	if err != nil && IsRetryable(err) {
+		tried := map[string]bool{accountID: true}
+		for attempt := 0; attempt < maxTransportRetries; attempt++ {
+			next, nerr := s.nextHealthyAccountMulti(tried)
+			if nerr != nil {
+				break
+			}
+			tried[next.ID] = true
+			log.Printf("[transport-retry] chat: account %s -> %s (attempt %d) err=%v", accountID, next.ID, attempt+1, err)
+			release2, err2 := s.accountConcurrency.Acquire(ctx, next.ID)
+			if err2 != nil {
+				continue
+			}
+			if s.accountPool != nil {
+				s.accountPool.MarkCall(next.ID)
+			}
+			nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+			result2, err2 := s.accountClient(next.ID).Chat(ctx, nextAccount, request)
+			release2()
+			s.markAccountResult(next.ID, err2)
+			if err2 == nil {
+				if !outbound.IsProxyIsolated(err) {
+					s.accountPool.MarkFailure(accountID, err, s.getRateLimitCooldown())
+				}
+				s.accountPool.MarkSuccess(next.ID)
+				return result2, nil
+			}
+			if !outbound.IsProxyIsolated(err2) {
+				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+			}
+			if IsRetryable(err2) {
+				err = err2
+				continue
+			}
+			return result2, err2
+		}
+	}
+
 	return result, err
 }
 
+// maxTransportRetries limits how many times we retry the upstream request
+// with a different account when a transport-level error (proxy drop, WS
+// timeout, etc.) occurs BEFORE any text has been streamed to the client.
+// Once text has been streamed, we cannot retry without duplicating content,
+// so the retry path only activates when streamedLen == 0.
+const maxTransportRetries = 2
+
 func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, account chathub.Account, request chathub.Request, onEvent func(chathub.StreamEvent) error) (chathub.Result, error) {
+	// Track whether any text has been streamed to the client. If the
+	// upstream connection fails before any text flows, we can safely retry
+	// with a different account (and thus a different exit IP) without
+	// producing duplicate content.
+	var streamedLen int64
+	wrappedOnEvent := func(ev chathub.StreamEvent) error {
+		if ev.Kind == "text" && ev.Text != "" {
+			atomic.AddInt64(&streamedLen, int64(len(ev.Text)))
+		}
+		return onEvent(ev)
+	}
+
 	release, err := s.accountConcurrency.Acquire(ctx, accountID)
 	if err != nil {
 		return chathub.Result{}, err
@@ -168,12 +231,82 @@ func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, ac
 	if s.accountPool != nil {
 		s.accountPool.MarkCall(accountID)
 	}
-	result, err := s.accountClient(accountID).ChatWithEvents(ctx, account, request, onEvent)
+	result, err := s.accountClient(accountID).ChatWithEvents(ctx, account, request, wrappedOnEvent)
 	s.markAccountResult(accountID, err)
+
+	// Transport-level retry: if the error is retryable (proxy drop, timeout,
+	// etc.) and NO text was streamed, retry with a different account.
+	// This is transparent to the client because nothing was sent yet.
+	// We only retry auto-selected accounts (not explicitly bound ones)
+	// and only when no text was streamed, so there is zero content
+	// duplication.
+	if err != nil && atomic.LoadInt64(&streamedLen) == 0 && IsRetryable(err) {
+		tried := map[string]bool{accountID: true}
+		for attempt := 0; attempt < maxTransportRetries; attempt++ {
+			next, nerr := s.nextHealthyAccountMulti(tried)
+			if nerr != nil {
+				break
+			}
+			tried[next.ID] = true
+			log.Printf("[transport-retry] events: account %s -> %s (attempt %d) err=%v", accountID, next.ID, attempt+1, err)
+			release2, err2 := s.accountConcurrency.Acquire(ctx, next.ID)
+			if err2 != nil {
+				continue
+			}
+			if s.accountPool != nil {
+				s.accountPool.MarkCall(next.ID)
+			}
+			nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+			// Reset streamedLen for the new attempt — no text was sent.
+			atomic.StoreInt64(&streamedLen, 0)
+			result2, err2 := s.accountClient(next.ID).ChatWithEvents(ctx, nextAccount, request, wrappedOnEvent)
+			release2()
+			s.markAccountResult(next.ID, err2)
+			if err2 == nil {
+				// Success: mark original account's failure (if not proxy-isolated).
+				if !outbound.IsProxyIsolated(err) {
+					s.accountPool.MarkFailure(accountID, err, s.getRateLimitCooldown())
+				}
+				s.accountPool.MarkSuccess(next.ID)
+				return result2, nil
+			}
+			// This attempt also failed. If still no text streamed, try next account.
+			if atomic.LoadInt64(&streamedLen) == 0 && IsRetryable(err2) {
+				if !outbound.IsProxyIsolated(err2) {
+					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+				}
+				err = err2
+				continue
+			}
+			// Text was streamed or error is not retryable — return this error.
+			if !outbound.IsProxyIsolated(err2) {
+				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+			}
+			return result2, err2
+		}
+	}
+
 	return result, err
 }
 
 func (s *Server) chatWithAccountReasoning(ctx context.Context, accountID string, account chathub.Account, request chathub.Request, onDelta, onReasoning func(string) error) (chathub.Result, error) {
+	// Track whether any text/reasoning has been streamed to the client.
+	// If the upstream connection fails before any text flows, we can
+	// safely retry with a different account.
+	var streamedLen int64
+	wrappedOnDelta := func(content string) error {
+		if content != "" {
+			atomic.AddInt64(&streamedLen, int64(len(content)))
+		}
+		return onDelta(content)
+	}
+	wrappedOnReasoning := func(reasoning string) error {
+		if reasoning != "" {
+			atomic.AddInt64(&streamedLen, int64(len(reasoning)))
+		}
+		return onReasoning(reasoning)
+	}
+
 	release, err := s.accountConcurrency.Acquire(ctx, accountID)
 	if err != nil {
 		return chathub.Result{}, err
@@ -182,7 +315,51 @@ func (s *Server) chatWithAccountReasoning(ctx context.Context, accountID string,
 	if s.accountPool != nil {
 		s.accountPool.MarkCall(accountID)
 	}
-	result, err := s.accountClient(accountID).ChatWithReasoning(ctx, account, request, onDelta, onReasoning)
+	result, err := s.accountClient(accountID).ChatWithReasoning(ctx, account, request, wrappedOnDelta, wrappedOnReasoning)
 	s.markAccountResult(accountID, err)
+
+	// Transport-level retry: same logic as chatWithAccountEvents.
+	if err != nil && atomic.LoadInt64(&streamedLen) == 0 && IsRetryable(err) {
+		tried := map[string]bool{accountID: true}
+		for attempt := 0; attempt < maxTransportRetries; attempt++ {
+			next, nerr := s.nextHealthyAccountMulti(tried)
+			if nerr != nil {
+				break
+			}
+			tried[next.ID] = true
+			log.Printf("[transport-retry] reasoning: account %s -> %s (attempt %d) err=%v", accountID, next.ID, attempt+1, err)
+			release2, err2 := s.accountConcurrency.Acquire(ctx, next.ID)
+			if err2 != nil {
+				continue
+			}
+			if s.accountPool != nil {
+				s.accountPool.MarkCall(next.ID)
+			}
+			nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+			atomic.StoreInt64(&streamedLen, 0)
+			result2, err2 := s.accountClient(next.ID).ChatWithReasoning(ctx, nextAccount, request, wrappedOnDelta, wrappedOnReasoning)
+			release2()
+			s.markAccountResult(next.ID, err2)
+			if err2 == nil {
+				if !outbound.IsProxyIsolated(err) {
+					s.accountPool.MarkFailure(accountID, err, s.getRateLimitCooldown())
+				}
+				s.accountPool.MarkSuccess(next.ID)
+				return result2, nil
+			}
+			if atomic.LoadInt64(&streamedLen) == 0 && IsRetryable(err2) {
+				if !outbound.IsProxyIsolated(err2) {
+					s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+				}
+				err = err2
+				continue
+			}
+			if !outbound.IsProxyIsolated(err2) {
+				s.accountPool.MarkFailure(next.ID, err2, s.getRateLimitCooldown())
+			}
+			return result2, err2
+		}
+	}
+
 	return result, err
 }

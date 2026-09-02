@@ -354,9 +354,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 }
 
 // maxAutoContinue limits how many times we auto-continue an incomplete
-// response to avoid infinite loops. Each continue gets its own deadline,
-// so 2 continues = up to 3x the single-request timeout.
-const maxAutoContinue = 2
+// response. Set to 1: one continuation attempt is enough for most truncated
+// responses, and multiple attempts increase the risk of duplicate content.
+const maxAutoContinue = 1
 
 // chatDeadlineFromCtx derives the internal deadline from the context's
 // deadline, leaving a 10-second safety margin so the auto-continue path
