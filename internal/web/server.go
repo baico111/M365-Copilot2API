@@ -690,6 +690,8 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt       time.Time  `json:"expiresAt,omitempty"`
 		UpdatedAt       time.Time  `json:"updatedAt,omitempty"`
 		BoundProxy      string     `json:"boundProxy,omitempty"`
+		SingBoxNode     string     `json:"singboxNode,omitempty"`
+		SingBoxHealth   string     `json:"singboxHealth,omitempty"`
 	}
 	out := make([]view, 0, len(list))
 	for _, a := range list {
@@ -722,6 +724,14 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 			OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt, BoundProxy: a.BoundProxy,
 		})
+		// Add sing-box node info if sing-box is running and account has
+		// no explicit bound proxy (sing-box nodes are used instead).
+		if a.BoundProxy == "" {
+			if idx, name, health, ok := outbound.SingBoxNodeInfo(a.ID); ok {
+				out[len(out)-1].SingBoxNode = fmt.Sprintf("[%d] %s", idx, name)
+				out[len(out)-1].SingBoxHealth = health
+			}
+		}
 	}
 	jsonOut(w, map[string]any{"accounts": out, "health": s.accountPool.Snapshot()})
 }

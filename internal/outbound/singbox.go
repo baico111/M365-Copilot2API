@@ -179,10 +179,18 @@ func ConfigureSingBox(subscriptionURL string) error {
 		// clear all clients so that HTTPClient()/WebSocketDialer() fall
 		// back to direct connection instead of trying to connect to dead
 		// SOCKS5 ports, which causes "connection refused" and 502 errors.
+		// Keep sbNodeList for status display, but mark all nodes offline.
 		sbClients = nil
 		sbNodeClients = nil
 		sbNodePorts = nil
-		sbNodeHealth = nil
+		for _, nh := range sbNodeHealth {
+			if nh != nil {
+				nh.mu.Lock()
+				nh.health = "offline"
+				nh.lastError = "sing-box process exited"
+				nh.mu.Unlock()
+			}
+		}
 		sbMu.Unlock()
 	}()
 
@@ -292,7 +300,14 @@ func refreshLoop(cfg *SingBoxConfig) {
 				sbClients = nil
 				sbNodeClients = nil
 				sbNodePorts = nil
-				sbNodeHealth = nil
+				for _, nh := range sbNodeHealth {
+					if nh != nil {
+						nh.mu.Lock()
+						nh.health = "offline"
+						nh.lastError = "sing-box process exited"
+						nh.mu.Unlock()
+					}
+				}
 			}
 			sbMu.Unlock()
 		}(reloadCmd)
@@ -1042,10 +1057,44 @@ func SingBoxRunning() bool {
 	return sbProcess != nil
 }
 
+// SingBoxNodeInfo returns the node index and name assigned to a given
+// account ID, plus the node's health status. Returns empty strings and
+// false if sing-box is not running or the account has no node assignment.
+func SingBoxNodeInfo(accountID string) (int, string, string, bool) {
+	sbMu.Lock()
+	defer sbMu.Unlock()
+	if sbNodeClients == nil || len(sbNodeClients) == 0 || len(sbNodeList) == 0 {
+		return 0, "", "", false
+	}
+	n := len(sbNodeClients)
+	idx := int(stableHash(accountID) % uint64(n))
+	name := ""
+	if idx < len(sbNodeList) {
+		name = sbNodeList[idx]
+	}
+	health := "unknown"
+	if nh, ok := sbNodeHealth[idx]; ok && nh != nil {
+		nh.mu.Lock()
+		health = nh.health
+		nh.mu.Unlock()
+	}
+	return idx, name, health, true
+}
+
 // SingBoxHealthCheck triggers an immediate health check of all nodes.
 // Returns immediately; the checks run in the background.
 func SingBoxHealthCheck() {
 	go checkAllNodes()
+}
+
+// stableHash returns a deterministic uint64 hash for a string (FNV-1a).
+func stableHash(s string) uint64 {
+	var h uint64 = 1469598103934665603
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
+	}
+	return h
 }
 
 // SingBoxNodeCount returns the number of available (non-isolated) per-node clients.
