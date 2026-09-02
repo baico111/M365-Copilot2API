@@ -632,7 +632,11 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	references := make(map[string]Reference)
 	var firstServiceResponse bool
 
-	deadline := time.Now().Add(5 * time.Minute)
+	// 10-minute deadline: long responses (code generation, multi-step
+	// reasoning, deep research) can take 5+ minutes. The previous 5-minute
+	// limit truncated these, causing incomplete answers. 10 minutes gives
+	// ample room while still bounding resource usage.
+	deadline := time.Now().Add(10 * time.Minute)
 	type wsRead struct {
 		msg []byte
 		err error
@@ -676,7 +680,11 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				}
 				continue
 			}
-			_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+			// 120s per-frame read deadline: upstream frame intervals are
+			// typically <16s (HAR report 06), but long reasoning or
+			// tool execution can pause the stream. 120s gives a 3x safety
+			// margin over the observed 16s ping interval.
+			_ = conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 			_, msg, err := conn.ReadMessage()
 			select {
 			case readCh <- wsRead{msg: msg, err: err}:
@@ -1084,8 +1092,23 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 
 	// Reaching the overall deadline without a SignalR completion frame is
-	// an incomplete upstream response. Do not return accumulated deltas as if
-	// they were a successful, finished answer.
+	// an incomplete upstream response. However, if we already have
+	// streamed text, return it as a partial result so streaming clients
+	// receive the content they already saw instead of a hard failure.
+	// The finalizeText call below reconciles streamed vs final (which is
+	// empty here, so streamed text is kept as-is).
+	streamedText := streamed.String()
+	if streamedText != "" {
+		log.Printf("[chathub] deadline exceeded with %d bytes of streamed text; returning partial result", len(streamedText))
+		returnConn = false
+		return Result{
+			Text:       streamedText,
+			Reasoning:  reasoningBuf.String(),
+			Events:     events,
+			Normalized: NormalizeEvents(events),
+			Timestamps: ts,
+		}, nil
+	}
 	returnConn = false
 	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
 }
