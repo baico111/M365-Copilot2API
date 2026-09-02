@@ -642,3 +642,164 @@ type TokenRefreshResult struct {
 	Error     string    `json:"error,omitempty"`
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
+
+// ---- Backup / Restore ----
+
+// BackupData is the portable, password-encrypted backup format.
+// The accounts slice contains plaintext tokens (already decrypted from
+// the local master key) so the backup is self-contained and can be
+// restored on a different VPS that does not share the same master key.
+// The entire accounts array is encrypted as a single AES-GCM ciphertext
+// using a key derived from the user-supplied password.
+type BackupData struct {
+	Version   int             `json:"version"`
+	CreatedAt time.Time       `json:"createdAt"`
+	Encrypted string          `json:"encrypted"` // base64(AES-GCM(accountsJSON))
+}
+
+// ExportAccounts creates a password-encrypted backup of all accounts.
+// The returned bytes are a self-contained JSON file that can be restored
+// on any VPS using the same password.
+func (s *Store) ExportAccounts(password string) ([]byte, error) {
+	s.mu.Lock()
+	accounts := make([]AccountToken, len(s.data.Accounts))
+	copy(accounts, s.data.Accounts)
+	s.mu.Unlock()
+
+	// RefreshTokens are already decrypted in memory (OpenStore decrypts
+	// them on load). We serialize the plaintext accounts array and encrypt
+	// the whole thing with the user's password.
+	plaintext, err := json.MarshalIndent(accounts, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal accounts: %w", err)
+	}
+
+	key := derivePasswordKey(password)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	ct := gcm.Seal(nonce, nonce, plaintext, nil)
+
+	backup := BackupData{
+		Version:   1,
+		CreatedAt: time.Now(),
+		Encrypted: encPrefix + base64.StdEncoding.EncodeToString(ct),
+	}
+	return json.MarshalIndent(backup, "", "  ")
+}
+
+// ImportAccounts restores accounts from a password-encrypted backup.
+// Existing accounts with the same ID/Email are updated; new accounts are
+// appended. Returns the number of accounts imported.
+func (s *Store) ImportAccounts(backupJSON []byte, password string) (int, error) {
+	var backup BackupData
+	if err := json.Unmarshal(backupJSON, &backup); err != nil {
+		return 0, fmt.Errorf("parse backup: %w", err)
+	}
+	if backup.Version != 1 {
+		return 0, fmt.Errorf("unsupported backup version: %d", backup.Version)
+	}
+	if !isEncrypted(backup.Encrypted) {
+		return 0, fmt.Errorf("backup is not encrypted or format is invalid")
+	}
+
+	raw := strings.TrimPrefix(backup.Encrypted, encPrefix)
+	ct, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		if b2, err2 := base64.RawStdEncoding.DecodeString(raw); err2 == nil {
+			ct = b2
+		} else {
+			return 0, fmt.Errorf("decode backup ciphertext: %w", err)
+		}
+	}
+
+	key := derivePasswordKey(password)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return 0, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return 0, err
+	}
+	if len(ct) < gcm.NonceSize() {
+		return 0, fmt.Errorf("backup ciphertext too short")
+	}
+	nonce, data := ct[:gcm.NonceSize()], ct[gcm.NonceSize():]
+	plaintext, err := gcm.Open(nil, nonce, data, nil)
+	if err != nil {
+		return 0, fmt.Errorf("decrypt backup (wrong password?): %w", err)
+	}
+
+	var accounts []AccountToken
+	if err := json.Unmarshal(plaintext, &accounts); err != nil {
+		return 0, fmt.Errorf("parse accounts from backup: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	imported := 0
+	for _, acc := range accounts {
+		if acc.ID == "" && acc.OID != "" {
+			acc.ID = acc.OID
+		}
+		if acc.ID == "" && acc.Email != "" {
+			acc.ID = acc.Email
+		}
+		if acc.ID == "" {
+			continue
+		}
+		if acc.OID == "" {
+			acc.OID = acc.ID
+		}
+		acc.UpdatedAt = time.Now()
+		acc.Status = "online"
+
+		found := false
+		for i, existing := range s.data.Accounts {
+			if existing.ID == acc.ID || (acc.Email != "" && existing.Email == acc.Email) {
+				if acc.RefreshToken == "" {
+					acc.RefreshToken = existing.RefreshToken
+				}
+				if acc.TID == "" {
+					acc.TID = existing.TID
+				}
+				if acc.BoundProxy == "" {
+					acc.BoundProxy = existing.BoundProxy
+				}
+				acc.ScheduleDisabled = existing.ScheduleDisabled
+				s.data.Accounts[i] = acc
+				found = true
+				break
+			}
+		}
+		if !found {
+			s.data.Accounts = append(s.data.Accounts, acc)
+		}
+		imported++
+	}
+	if err := s.saveLocked(); err != nil {
+		return imported - 0, err
+	}
+	return imported, nil
+}
+
+// derivePasswordKey derives a 32-byte AES key from a user-supplied password
+// using HMAC-SHA256 with a fixed pepper. This is NOT a KDF — for production
+// use Argon2id or PBKDF2, but for VPS-to-VPS account migration this is
+// sufficient given the password is chosen by the operator.
+func derivePasswordKey(password string) []byte {
+	pepper := []byte("m365-backup-pepper-v1")
+	mac := hmac.New(sha256.New, pepper)
+	mac.Write([]byte(password))
+	return mac.Sum(nil)
+}

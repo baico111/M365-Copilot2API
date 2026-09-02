@@ -539,6 +539,25 @@ if (response.output_text) {
           </div>
           <table class="table"><thead><tr><th>Account</th><th>Calls</th><th>Status</th><th>Updated</th><th>Scheduling</th><th>Proxy</th><th>Actions</th></tr></thead><tbody id="accountRows"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody></table>
         </div>
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><span class="card-title">备份与恢复</span></div>
+          <div class="card-body">
+            <p class="form-hint" style="margin-bottom:12px">导出所有账号为密码加密的备份文件，可在另一台 VPS 上恢复。备份文件包含 AccessToken 和 RefreshToken，请妥善保管。</p>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+              <div>
+                <label class="form-label">导出备份</label>
+                <input class="form-input" id="backupPassword" type="password" placeholder="设置备份密码（至少6位）" style="margin-bottom:8px">
+                <button class="btn primary" onclick="accountBackupExport()" style="width:100%"><i data-lucide="download" style="width:14px;height:14px"></i> 下载备份文件</button>
+              </div>
+              <div>
+                <label class="form-label">恢复备份</label>
+                <input class="form-input" id="restorePassword" type="password" placeholder="输入备份密码" style="margin-bottom:8px">
+                <input class="form-input" id="restoreFile" type="file" accept=".json" style="margin-bottom:8px;font-size:12px">
+                <button class="btn" onclick="accountRestoreImport()" style="width:100%"><i data-lucide="upload" style="width:14px;height:14px"></i> 恢复账号</button>
+              </div>
+            </div>
+          </div>
+        </div>
       </section>
 
       <!-- API Keys -->
@@ -1612,6 +1631,48 @@ async function saveSettings(){
 }
 
 setInterval(()=>{if($('page-accounts').style.display!=='none')loadAccounts();},15000);
+
+async function accountBackupExport(){
+  const pwd=$('backupPassword').value;
+  if(!pwd||pwd.length<6)return showNotice('备份密码至少6位','error');
+  try{
+    showNotice('正在生成备份...','info');
+    const resp=await fetch('/api/accounts/backup',{method:'POST',headers:{'Content-Type':'application/json',...adminAuthHeaders()},body:JSON.stringify({password:pwd})});
+    if(!resp.ok){const e=await resp.json().catch(()=>({error:{message:'backup failed'}}));throw new Error(e.error?.message||'backup failed');}
+    const blob=await resp.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;
+    a.download='m365-accounts-backup.json';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showNotice('备份文件已下载','success');
+    $('backupPassword').value='';
+  }catch(e){showNotice(e.message,'error');}
+}
+async function accountRestoreImport(){
+  const pwd=$('restorePassword').value;
+  const fileInput=$('restoreFile');
+  if(!pwd||pwd.length<6)return showNotice('请输入备份密码','error');
+  if(!fileInput.files||!fileInput.files[0])return showNotice('请选择备份文件','error');
+  if(!confirm('确定从备份文件恢复账号？现有同 ID/Email 的账号将被更新。'))return;
+  try{
+    showNotice('正在恢复...','info');
+    const fd=new FormData();
+    fd.append('file',fileInput.files[0]);
+    fd.append('password',pwd);
+    const resp=await fetch('/api/accounts/restore',{method:'POST',headers:{...adminAuthHeaders()},body:fd});
+    const d=await resp.json();
+    if(!resp.ok)throw new Error(d.error?.message||'restore failed');
+    showNotice('恢复成功，导入 '+d.imported+' 个账号','success');
+    $('restorePassword').value='';fileInput.value='';
+    loadAccounts();
+  }catch(e){showNotice(e.message,'error');}
+}
+function adminAuthHeaders(){
+  const c=document.cookie.match(/m365_admin_session=([^;]+)/);
+  return c?{'X-Admin-Session':c[1]}:{};
+}
 
 // Init
 try{lucide.createIcons();}catch(e){}

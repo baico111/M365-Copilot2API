@@ -368,6 +368,8 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/accounts/provision", s.provisionAccount)
 	m.HandleFunc("/api/accounts/bind-proxy", s.bindProxy)
 	m.HandleFunc("/api/accounts/probe", s.probeAccount)
+	m.HandleFunc("/api/accounts/backup", s.accountBackup)
+	m.HandleFunc("/api/accounts/restore", s.accountRestore)
 	m.HandleFunc("/api/auth/start", s.startPKCE)
 	m.HandleFunc("/api/auth/status", s.pkceStatus)
 	m.HandleFunc("/api/auth/callback", s.callbackPKCE)
