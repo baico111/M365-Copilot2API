@@ -354,9 +354,20 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 }
 
 // maxAutoContinue limits how many times we auto-continue an incomplete
-// response to avoid infinite loops. Each continue gets its own 10-minute
-// deadline, so 2 continues = up to 30 minutes total.
+// response to avoid infinite loops. Each continue gets its own deadline,
+// so 2 continues = up to 3x the single-request timeout.
 const maxAutoContinue = 2
+
+// chatDeadlineFromCtx derives the internal deadline from the context's
+// deadline, leaving a 10-second safety margin so the auto-continue path
+// triggers BEFORE ctx.Done() kills the request. If the context has no
+// deadline (shouldn't happen in practice), fall back to 8 minutes.
+func chatDeadlineFromCtx(ctx context.Context) time.Time {
+	if dl, ok := ctx.Deadline(); ok {
+		return dl.Add(-10 * time.Second)
+	}
+	return time.Now().Add(8 * time.Minute)
+}
 
 // chatWithHandlersDepth is the core implementation with a depth counter
 // to limit recursive auto-continue calls.
@@ -643,11 +654,11 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 	references := make(map[string]Reference)
 	var firstServiceResponse bool
 
-	// 10-minute deadline: long responses (code generation, multi-step
-	// reasoning, deep research) can take 5+ minutes. The previous 5-minute
-	// limit truncated these, causing incomplete answers. 10 minutes gives
-	// ample room while still bounding resource usage.
-	deadline := time.Now().Add(10 * time.Minute)
+	// Internal deadline is derived from the context deadline minus a
+	// 10-second safety margin. This ensures the auto-continue path
+	// triggers BEFORE ctx.Done() kills the request, which would bypass
+	// continuation and discard already-streamed text.
+	deadline := chatDeadlineFromCtx(ctx)
 	type wsRead struct {
 		msg []byte
 		err error
@@ -691,11 +702,12 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 				}
 				continue
 			}
-			// 120s per-frame read deadline: upstream frame intervals are
-			// typically <16s (HAR report 06), but long reasoning or
-			// tool execution can pause the stream. 120s gives a 3x safety
-			// margin over the observed 16s ping interval.
-			_ = conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+			// 180s per-frame read deadline: when routing through SOCKS5
+			// proxies (sing-box), the proxy chain adds latency and may
+			// pause during long reasoning. 180s gives ample room while
+			// still catching truly dead connections. The previous 120s
+			// caused false timeout errors at ~2-3 minutes when the proxy
+			// had brief network pauses.
 			_, msg, err := conn.ReadMessage()
 			select {
 			case readCh <- wsRead{msg: msg, err: err}:
@@ -713,18 +725,47 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 		var read wsRead
 		select {
 		case <-ctx.Done():
+			// Context cancelled or deadline exceeded. If we already have
+			// streamed text, fall through to the auto-continue path below
+			// instead of returning an error that discards the partial
+			// response. This is critical: without this, a 5-minute HTTP
+			// context timeout kills the request even though the ChatHub
+			// internal deadline hasn't been reached yet.
+			streamedText := streamed.String()
+			if streamedText != "" && !errors.Is(ctx.Err(), context.Canceled) && depth < maxAutoContinue {
+				log.Printf("[chathub] ctx deadline exceeded with %d bytes streamed; falling through to auto-continue (depth=%d)", len(streamedText), depth)
+				break
+			}
 			returnConn = false
 			_ = conn.Close()
 			if errors.Is(ctx.Err(), context.Canceled) {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: ctx.Err()}
 			}
+			// Return partial result if we have streamed text
+			if streamedText != "" {
+				log.Printf("[chathub] ctx deadline exceeded, returning partial result (%d bytes)", len(streamedText))
+				returnConn = false
+				return Result{Text: streamedText, Reasoning: reasoningBuf.String(), Events: events, Normalized: NormalizeEvents(events), Timestamps: ts}, nil
+			}
 			return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", cause: ctx.Err()}
 		case r, ok := <-readCh:
 			if !ok {
 				if ctx.Err() != nil {
+					// Channel closed due to context cancellation.
+					// Fall through to auto-continue if we have streamed text.
+					streamedText := streamed.String()
+					if streamedText != "" && !errors.Is(ctx.Err(), context.Canceled) && depth < maxAutoContinue {
+						log.Printf("[chathub] readCh closed (ctx done) with %d bytes streamed; falling through to auto-continue (depth=%d)", len(streamedText), depth)
+						break
+					}
 					returnConn = false
 					if errors.Is(ctx.Err(), context.Canceled) {
 						return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: ctx.Err()}
+					}
+					if streamedText != "" {
+						log.Printf("[chathub] readCh closed, returning partial result (%d bytes)", len(streamedText))
+						returnConn = false
+						return Result{Text: streamedText, Reasoning: reasoningBuf.String(), Events: events, Normalized: NormalizeEvents(events), Timestamps: ts}, nil
 					}
 					return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", cause: ctx.Err()}
 				}
@@ -734,12 +775,36 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 			read = r
 		}
 		if read.err != nil {
+			// WebSocket read error (timeout, connection reset, etc).
+			// If we already have streamed text and this is a timeout-type
+			// error (not a client cancel), fall through to auto-continue
+			// instead of discarding the partial response.
+			streamedText := streamed.String()
+			isCancel := errors.Is(read.err, context.Canceled)
+			isTimeout := strings.Contains(strings.ToLower(read.err.Error()), "timeout") || errors.Is(read.err, context.DeadlineExceeded)
+			if streamedText != "" && !isCancel && (isTimeout || depth < maxAutoContinue) {
+				log.Printf("[chathub] ws read error with %d bytes streamed; falling through to auto-continue (depth=%d): %v", len(streamedText), depth, read.err)
+				break
+			}
 			returnConn = false
-			if errors.Is(read.err, context.Canceled) {
+			if isCancel {
 				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: fmt.Errorf("ws read before completion: %w", read.err)}
 			}
+			// Return partial result if we have streamed text
+			if streamedText != "" {
+				kind := "WS_READ_TIMEOUT"
+				if !isTimeout {
+					kind = classifyTransportError(read.err)
+					if kind == "TCP" {
+						kind = "WS_READ_TIMEOUT"
+					}
+				}
+				log.Printf("[chathub] ws read error, returning partial result (%d bytes): kind=%s", len(streamedText), kind)
+				returnConn = false
+				return Result{Text: streamedText, Reasoning: reasoningBuf.String(), Events: events, Normalized: NormalizeEvents(events), Timestamps: ts}, nil
+			}
 			kind := "WS_READ_TIMEOUT"
-			if strings.Contains(strings.ToLower(read.err.Error()), "timeout") || errors.Is(read.err, context.DeadlineExceeded) {
+			if isTimeout {
 				kind = "WS_READ_TIMEOUT"
 			} else {
 				kind = classifyTransportError(read.err)

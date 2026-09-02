@@ -2303,8 +2303,36 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err != nil {
+			// If we already streamed text to the client, treat this as a
+			// successful (but incomplete) response and close the SSE stream
+			// normally with finish_reason="stop" instead of sending an error.
+			// This prevents clients from seeing "truncated" responses as
+			// errors when the text was already delivered via deltas.
+			if text.Len() > 0 || len(streamedTools) > 0 {
+				log.Printf("[req-trace] id=%s stage=stream_partial_complete text=%d tools=%d err=%v", requestID, text.Len(), len(streamedTools), err)
+				if !outbound.IsProxyIsolated(err) {
+					s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+				}
+				if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(acc.ID)
+				}
+				// Emit any remaining buffered text
+				if pending.Len() > 0 {
+					_ = emitText(pending.String())
+				}
+				finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
+				_ = sw.data(mustJSON(finishChunk))
+				_ = sw.data("[DONE]")
+				if body.User != "" && res.ConversationID != "" {
+					s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
+				}
+				s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
+				return
+			}
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
-			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+			if !outbound.IsProxyIsolated(err) {
+				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+			}
 			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
@@ -2646,9 +2674,29 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					s.accountPool.MarkImageLimited(acc.ID)
 				}
 			}
+	} else {
+		// If we already streamed reasoning or text, treat this as a
+		// successful (but incomplete) response with finish_reason="stop"
+		// instead of sending an error to the client.
+		if streamedReasoningLen > 0 {
+			log.Printf("[req-trace] id=%s stage=stream_partial_complete reasoning=%d err=%v", requestID, streamedReasoningLen, err)
+			if !outbound.IsProxyIsolated(err) {
+				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+			}
+			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+				s.accountPool.MarkImageLimited(acc.ID)
+			}
+			if content := contentFilter.Flush(); content != "" {
+				_ = writeChunk(map[string]any{"content": content})
+			}
+			if reasoning := reasoningFilter.Flush(); reasoning != "" {
+				_ = writeChunk(map[string]any{"reasoning_content": reasoning})
+			}
 		} else {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
-			s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+			if !outbound.IsProxyIsolated(err) {
+				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+			}
 			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 				s.accountPool.MarkImageLimited(acc.ID)
 			}
@@ -2665,16 +2713,19 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			msg = sanitizePublicInternalText(msg)
 			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
 		}
-		pt := EstimateTokens(prompt)
-		ct := EstimateTokens(res.Text)
-		log.Printf("[usage] stream id=%s pt=%d ct=%d res.Text=%d", id, pt, ct, len(res.Text))
-		if err == nil && ct == 0 {
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "upstream returned empty completion; the requested model may be unavailable for this tenant", "code": "upstream_error"}})+"\n\n")
-		}
-		finish := "stop"
-		if err != nil {
-			finish = "error"
-		}
+	}
+	pt := EstimateTokens(prompt)
+	ct := EstimateTokens(res.Text)
+	log.Printf("[usage] stream id=%s pt=%d ct=%d res.Text=%d", id, pt, ct, len(res.Text))
+	if err == nil && ct == 0 {
+		_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "upstream returned empty completion; the requested model may be unavailable for this tenant", "code": "upstream_error"}})+"\n\n")
+	}
+	// If we streamed content but got an error, use "stop" not "error"
+	// so the client treats the response as complete, not failed.
+	finish := "stop"
+	if err != nil && streamedReasoningLen == 0 {
+		finish = "error"
+	}
 		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
 		if res.Throttling != nil {
 			usageChunk["x_m365_throttling"] = res.Throttling
