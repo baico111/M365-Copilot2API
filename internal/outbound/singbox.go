@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"context"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1025,75 +1024,27 @@ func checkNodeHealth(idx int) {
 	tcpConn.Close()
 	latency := time.Since(tcpStart)
 
-	// Step 2 (optional): try an HTTP request through the proxy to
-	// measure real-world latency, but DON'T fail on 403 or other HTTP
-	// status codes. The TCP check above already confirmed the proxy
-	// is alive; a 403 just means the check URL is blocked by the
-	// proxy's WAF, not that the proxy is broken.
-	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthCheckURL, nil)
-	if err != nil {
-		// TCP passed, HTTP request construction failed — still healthy.
-		nh.mu.Lock()
-		nh.health = "healthy"
-		nh.failures = 0
-		nh.latency = latency
-		nh.lastCheck = time.Now()
-		nh.lastError = ""
-		if nh.isolated {
-			log.Printf("[sing-box] node %d (port %d) recovered (tcp only), latency=%s", idx, port, latency)
-			nh.isolated = false
-			nh.isolatedAt = time.Time{}
-		}
-		nh.mu.Unlock()
-		return
-	}
-	start := time.Now()
-	resp, httpErr := clients.HTTP.Do(req)
-	httpLatency := time.Since(start)
-
-	if httpErr != nil {
-		// TCP passed but HTTP request failed. This could be a timeout
-		// or connection reset — still mark as healthy because the SOCKS5
-		// port is reachable. The actual upstream request to M365 may
-		// work fine (different target, different WAF rules).
-		nh.mu.Lock()
-		nh.health = "healthy"
-		nh.failures = 0
-		nh.latency = latency // use TCP latency as the metric
-		nh.lastCheck = time.Now()
-		nh.lastError = "http check skipped (tcp ok): " + httpErr.Error()
-		if nh.isolated {
-			log.Printf("[sing-box] node %d (port %d) recovered (tcp ok, http err), latency=%s", idx, port, latency)
-			nh.isolated = false
-			nh.isolatedAt = time.Time{}
-		}
-		nh.mu.Unlock()
-		return
-	}
-	resp.Body.Close()
-
-	// HTTP request succeeded. Record latency from HTTP round-trip
-	// (more representative of real request latency).
-	finalLatency := httpLatency
-	if finalLatency == 0 {
-		finalLatency = latency
-	}
-
-	// Note: we do NOT fail on HTTP 403 or other status codes.
-	// CF proxy nodes return 403 for gstatic.com but work fine for
-	// substrate.office.com. Only network-level errors indicate a
-	// broken proxy, and those are caught above.
-
+	// Step 2: Mark node as healthy based on TCP connectivity alone.
+	// We intentionally do NOT do an HTTP request through the proxy
+	// because:
+	// 1. Cloudflare proxy nodes return 403 for gstatic.com (WAF block),
+	//    which sing-box logs as "unexpected HTTP response status: 403"
+	//    on every health check — filling the logs with noise.
+	// 2. The 403 is NOT a proxy failure — the proxy works fine for
+	//    substrate.office.com (the actual upstream target).
+	// 3. The TCP check above already confirmed sing-box is running,
+	//    the SOCKS5 port is listening, and the proxy handshake completed.
+	//
+	// If we need HTTP latency measurement in the future, use a target
+	// that doesn't block CF nodes (e.g. substrate.office.com itself).
 	nh.mu.Lock()
 	nh.health = "healthy"
 	nh.failures = 0
-	nh.latency = finalLatency
+	nh.latency = latency
 	nh.lastCheck = time.Now()
 	nh.lastError = ""
 	if nh.isolated {
-		log.Printf("[sing-box] node %d (port %d) recovered, latency=%s", idx, port, finalLatency)
+		log.Printf("[sing-box] node %d (port %d) recovered, latency=%s", idx, port, latency)
 		nh.isolated = false
 		nh.isolatedAt = time.Time{}
 	}
