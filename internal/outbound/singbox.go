@@ -113,8 +113,21 @@ func ConfigureSingBox(subscriptionURL string) error {
 	sbNodeHealth = nil
 	sbMu.Unlock()
 
+	// CRITICAL: Validate config before starting sing-box.
+	// Running "sing-box check -c config.json" catches config errors
+	// (like "unknown network: ws") BEFORE we start the process, so
+	// we can return a clean error instead of starting a process that
+	// immediately exits with status 1 and leaves dead SOCKS5 ports.
+	configPath := filepath.Join(cfg.ConfigDir, "config.json")
+	checkCmd := exec.Command(cfg.BinaryPath, "check", "-c", configPath)
+	checkOutput, checkErr := checkCmd.CombinedOutput()
+	if checkErr != nil {
+		return fmt.Errorf("sing-box config validation failed: %s: %w",
+			strings.TrimSpace(string(checkOutput)), checkErr)
+	}
+
 	// Start sing-box
-	cmd := exec.Command(cfg.BinaryPath, "run", "-c", filepath.Join(cfg.ConfigDir, "config.json"))
+	cmd := exec.Command(cfg.BinaryPath, "run", "-c", configPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -239,9 +252,19 @@ func refreshLoop(cfg *SingBoxConfig) {
 		if len(selected) == 0 {
 			continue
 		}
+		// Validate config before starting the reload process.
+		configPath := filepath.Join(cfg.ConfigDir, "config.json")
+		checkCmd := exec.Command(cfg.BinaryPath, "check", "-c", configPath)
+		checkOutput, checkErr := checkCmd.CombinedOutput()
+		if checkErr != nil {
+			log.Printf("[sing-box] reload config validation failed: %s: %v",
+				strings.TrimSpace(string(checkOutput)), checkErr)
+			continue
+		}
+
 		// Start new sing-box process FIRST, then kill old one
 		// This avoids a window where no proxy is available.
-		reloadCmd := exec.Command(cfg.BinaryPath, "run", "-c", filepath.Join(cfg.ConfigDir, "config.json"))
+		reloadCmd := exec.Command(cfg.BinaryPath, "run", "-c", configPath)
 		reloadCmd.Stdout = os.Stdout
 		reloadCmd.Stderr = os.Stderr
 		if err := reloadCmd.Start(); err != nil {
@@ -469,6 +492,13 @@ func parseSubscriptionBody(body string) ([]vlessNode, error) {
 				continue
 			}
 			nodes = append(nodes, node)
+		} else if strings.HasPrefix(line, "trojan://") {
+			node, err := parseTrojan(line)
+			if err != nil {
+				log.Printf("[sing-box] skip trojan node: %v", err)
+				continue
+			}
+			nodes = append(nodes, node)
 		}
 	}
 	return nodes, nil
@@ -609,6 +639,44 @@ func parseSS(raw string) (vlessNode, error) {
 	return node, nil
 }
 
+// parseTrojan parses a trojan:// URL into a vlessNode.
+// Trojan always uses TLS; the password is the userinfo portion of the URL.
+func parseTrojan(raw string) (vlessNode, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return vlessNode{}, err
+	}
+	port, _ := strconvAtoi(u.Port())
+	if port == 0 {
+		port = 443
+	}
+	node := vlessNode{
+		UUID:    u.User.Username(), // trojan password
+		Address: u.Hostname(),
+		Port:    port,
+		Network: "tcp",
+		TLS:     true, // trojan always uses TLS
+		Name:    u.Fragment,
+		Raw:     raw,
+		Proto:   "trojan",
+	}
+	q := u.Query()
+	node.SNI = q.Get("sni")
+	if node.SNI == "" {
+		node.SNI = u.Hostname()
+	}
+	// Trojan supports ws transport too
+	if t := q.Get("type"); t != "" {
+		node.Network = t
+	}
+	node.Host = q.Get("host")
+	node.Path = q.Get("path")
+	if node.Path == "" {
+		node.Path = "/"
+	}
+	return node, nil
+}
+
 func nodeNames(nodes []vlessNode) []string {
 	out := make([]string, 0, len(nodes))
 	for _, n := range nodes {
@@ -628,13 +696,13 @@ func nodeNames(nodes []vlessNode) []string {
 const maxNodeInbounds = 50
 
 // buildSingBoxOutbound builds a sing-box outbound config map for the given
-// node, correctly handling vless, vmess, and ss (shadowsocks) protocols.
-// The key issue this solves: previously all nodes were hardcoded as "vless"
-// type, which caused sing-box to crash with "unknown network: ws" when the
-// subscription contained ss or vmess nodes, or when the network field was
-// placed at the wrong level in the config.
+// node, correctly handling vless, vmess, ss (shadowsocks), and trojan protocols.
+//
+// Key lesson from cnb2api: sing-box does NOT use a top-level "network" field
+// on vless/vmess outbounds. WebSocket transport must be configured via the
+// "transport" key with type="ws" — placing "network":"ws" at the outbound
+// level causes sing-box to crash with "unknown network: ws".
 func buildSingBoxOutbound(tag string, n vlessNode) map[string]any {
-	// Normalize the protocol: default to vless for backward compat.
 	proto := n.Proto
 	if proto == "" {
 		proto = "vless"
@@ -651,29 +719,27 @@ func buildSingBoxOutbound(tag string, n vlessNode) map[string]any {
 		ob["type"] = "shadowsocks"
 		ob["method"] = n.SSMethod
 		ob["password"] = n.SSPass
-		// ss does not use "network" or transport fields in sing-box config.
+		// ss does not use TLS or transport fields.
 		return ob
 
 	case "vmess":
 		ob["type"] = "vmess"
 		ob["uuid"] = n.UUID
-		// vmess in sing-box uses "network" at the outbound level.
-		ob["network"] = n.Network
 
 	case "vless":
 		ob["type"] = "vless"
 		ob["uuid"] = n.UUID
-		// vless in sing-box uses "network" at the outbound level.
-		ob["network"] = n.Network
+
+	case "trojan":
+		ob["type"] = "trojan"
+		ob["password"] = n.UUID
 
 	default:
-		// Unknown protocol — try vless as a fallback.
 		ob["type"] = "vless"
 		ob["uuid"] = n.UUID
-		ob["network"] = n.Network
 	}
 
-	// TLS configuration (applies to vless and vmess).
+	// TLS configuration (applies to vless, vmess, trojan).
 	if n.TLS {
 		tlsConf := map[string]any{
 			"enabled":     true,
@@ -688,18 +754,32 @@ func buildSingBoxOutbound(tag string, n vlessNode) map[string]any {
 		ob["tls"] = tlsConf
 	}
 
-	// WebSocket transport configuration.
-	// In sing-box, when network is "ws", the ws settings go under the
-	// "ws" key (not as a top-level "network" string).
+	// Transport configuration: sing-box uses the "transport" key (NOT a
+	// top-level "network" field). For WebSocket, the format is:
+	//   "transport": {"type": "ws", "path": "/...", "headers": {"Host": "..."}}
+	// This is the fix for "unknown network: ws" crash.
 	if n.Network == "ws" {
-		wsConf := map[string]any{
-			"path": n.Path,
+		path := n.Path
+		if path == "" {
+			path = "/"
+		}
+		transportCfg := map[string]any{
+			"type": "ws",
+			"path": path,
 		}
 		if n.Host != "" {
-			wsConf["host"] = n.Host
+			transportCfg["headers"] = map[string]any{"Host": n.Host}
 		}
-		ob["ws"] = wsConf
+		ob["transport"] = transportCfg
+	} else if n.Network == "grpc" {
+		// gRPC transport (used by some vless/vmess nodes).
+		grpcCfg := map[string]any{
+			"type":    "grpc",
+			"service_name": n.Path,
+		}
+		ob["transport"] = grpcCfg
 	}
+	// For "tcp" (default), no transport field is needed.
 
 	return ob
 }
