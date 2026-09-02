@@ -151,7 +151,16 @@ func ConfigureSingBox(subscriptionURL string) error {
 		err := cmd.Wait()
 		log.Printf("[sing-box] process exited: %v", err)
 		sbMu.Lock()
-		sbProcess = nil
+		if sbProcess == cmd {
+			sbProcess = nil
+		}
+		// CRITICAL: When sing-box crashes (e.g., config error), we must
+		// clear all clients so that HTTPClient()/WebSocketDialer() fall
+		// back to direct connection instead of trying to connect to dead
+		// SOCKS5 ports, which causes "connection refused" and 502 errors.
+		sbClients = nil
+		sbNodeClients = nil
+		sbNodePorts = nil
 		sbMu.Unlock()
 	}()
 
@@ -248,6 +257,14 @@ func refreshLoop(cfg *SingBoxConfig) {
 		go func(c *exec.Cmd) {
 			err := c.Wait()
 			log.Printf("[sing-box] reloaded process exited: %v", err)
+			sbMu.Lock()
+			if sbProcess == c {
+				sbProcess = nil
+				sbClients = nil
+				sbNodeClients = nil
+				sbNodePorts = nil
+			}
+			sbMu.Unlock()
 		}(reloadCmd)
 	}
 }
@@ -286,6 +303,9 @@ type vlessNode struct {
 	Alpn    string
 	Name    string
 	Raw     string
+	Proto   string // vless, vmess, ss
+	SSMethod string // shadowsocks method
+	SSPass   string // shadowsocks password
 }
 
 func fetchSubscription(rawURL string) ([]vlessNode, error) {
@@ -426,6 +446,7 @@ func parseVLESS(raw string) (vlessNode, error) {
 		TLS:     true,
 		Name:    u.Fragment,
 		Raw:     raw,
+		Proto:   "vless",
 	}
 	q := u.Query()
 	if t := q.Get("type"); t != "" {
@@ -494,12 +515,14 @@ func parseVMess(raw string) (vlessNode, error) {
 		Path:    v.Path,
 		Name:    v.PS,
 		Raw:     raw,
+		Proto:   "vmess",
 	}, nil
 }
 
 func parseSS(raw string) (vlessNode, error) {
 	// ss://base64(method:password)@host:port#name
 	// or ss://base64(method:password@host:port)#name
+	// or ss://method:password@host:port#name (plain)
 	u, err := url.Parse(raw)
 	if err != nil {
 		return vlessNode{}, err
@@ -508,14 +531,37 @@ func parseSS(raw string) (vlessNode, error) {
 	if port == 0 {
 		port = 443
 	}
-	return vlessNode{
+	node := vlessNode{
 		Address: u.Hostname(),
 		Port:    port,
 		Network: "tcp",
 		TLS:     false,
 		Name:    u.Fragment,
 		Raw:     raw,
-	}, nil
+		Proto:   "ss",
+	}
+
+	// Decode userinfo (method:password)
+	userInfo := u.User.String()
+	if userInfo == "" {
+		// Try base64-encoded userinfo in the path
+		encoded := strings.TrimPrefix(u.Path, "/")
+		if encoded != "" {
+			if decoded, err := base64.StdEncoding.DecodeString(encoded); err == nil {
+				userInfo = string(decoded)
+			} else if decoded, err := base64.URLEncoding.DecodeString(encoded); err == nil {
+				userInfo = string(decoded)
+			}
+		}
+	}
+	if userInfo != "" {
+		parts := strings.SplitN(userInfo, ":", 2)
+		if len(parts) == 2 {
+			node.SSMethod = parts[0]
+			node.SSPass = parts[1]
+		}
+	}
+	return node, nil
 }
 
 func nodeNames(nodes []vlessNode) []string {
@@ -536,6 +582,83 @@ func nodeNames(nodes []vlessNode) []string {
 // gets its own local port so accounts can be distributed across IPs.
 const maxNodeInbounds = 50
 
+// buildSingBoxOutbound builds a sing-box outbound config map for the given
+// node, correctly handling vless, vmess, and ss (shadowsocks) protocols.
+// The key issue this solves: previously all nodes were hardcoded as "vless"
+// type, which caused sing-box to crash with "unknown network: ws" when the
+// subscription contained ss or vmess nodes, or when the network field was
+// placed at the wrong level in the config.
+func buildSingBoxOutbound(tag string, n vlessNode) map[string]any {
+	// Normalize the protocol: default to vless for backward compat.
+	proto := n.Proto
+	if proto == "" {
+		proto = "vless"
+	}
+
+	ob := map[string]any{
+		"tag":         tag,
+		"server":      n.Address,
+		"server_port": n.Port,
+	}
+
+	switch proto {
+	case "ss":
+		ob["type"] = "shadowsocks"
+		ob["method"] = n.SSMethod
+		ob["password"] = n.SSPass
+		// ss does not use "network" or transport fields in sing-box config.
+		return ob
+
+	case "vmess":
+		ob["type"] = "vmess"
+		ob["uuid"] = n.UUID
+		// vmess in sing-box uses "network" at the outbound level.
+		ob["network"] = n.Network
+
+	case "vless":
+		ob["type"] = "vless"
+		ob["uuid"] = n.UUID
+		// vless in sing-box uses "network" at the outbound level.
+		ob["network"] = n.Network
+
+	default:
+		// Unknown protocol — try vless as a fallback.
+		ob["type"] = "vless"
+		ob["uuid"] = n.UUID
+		ob["network"] = n.Network
+	}
+
+	// TLS configuration (applies to vless and vmess).
+	if n.TLS {
+		tlsConf := map[string]any{
+			"enabled":     true,
+			"server_name": n.SNI,
+		}
+		if n.FP != "" {
+			tlsConf["utls"] = map[string]any{
+				"enabled":     true,
+				"fingerprint": n.FP,
+			}
+		}
+		ob["tls"] = tlsConf
+	}
+
+	// WebSocket transport configuration.
+	// In sing-box, when network is "ws", the ws settings go under the
+	// "ws" key (not as a top-level "network" string).
+	if n.Network == "ws" {
+		wsConf := map[string]any{
+			"path": n.Path,
+		}
+		if n.Host != "" {
+			wsConf["host"] = n.Host
+		}
+		ob["ws"] = wsConf
+	}
+
+	return ob
+}
+
 // writeSingBoxConfig generates the sing-box config and returns the selected
 // node list so the caller can build matching per-node clients.
 func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) ([]vlessNode, error) {
@@ -554,36 +677,7 @@ func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) ([]vlessNode, err
 		tag := fmt.Sprintf("node-%d", i)
 		nodeTags = append(nodeTags, tag)
 
-		ob := map[string]any{
-			"tag":         tag,
-			"type":        "vless",
-			"server":      n.Address,
-			"server_port": n.Port,
-			"uuid":        n.UUID,
-			"network":     n.Network,
-		}
-		if n.TLS {
-			tlsConf := map[string]any{
-				"enabled":     true,
-				"server_name": n.SNI,
-			}
-			if n.FP != "" {
-				tlsConf["utls"] = map[string]any{
-					"enabled":     true,
-					"fingerprint": n.FP,
-				}
-			}
-			ob["tls"] = tlsConf
-		}
-		if n.Network == "ws" {
-			wsConf := map[string]any{
-				"path": n.Path,
-			}
-			if n.Host != "" {
-				wsConf["host"] = n.Host
-			}
-			ob["ws"] = wsConf
-		}
+		ob := buildSingBoxOutbound(tag, n)
 		outbounds = append(outbounds, ob)
 	}
 
