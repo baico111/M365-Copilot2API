@@ -2625,7 +2625,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				}
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				defer cancel2()
-				if res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, onDelta, onReasoning); err2 == nil {
+				if res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, onDeltaWrapped, onReasoningWrapped); err2 == nil {
 					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
