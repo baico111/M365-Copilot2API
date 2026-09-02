@@ -1491,18 +1491,41 @@ async function loadProxies(){
     }
     const info=p[0];
     const nodes=info.nodes||[];
-    const nodeHtml=nodes.length?nodes.map((n,i)=>`<div style="display:inline-block;margin:2px;padding:2px 10px;background:var(--bg-alt);border-radius:4px;font-size:12px">${esc(n)}</div>`).join(''):'';
+    const details=info.node_details||[];
+    const healthyCount=info.healthy_nodes||0;
+    const isolatedCount=info.isolated_nodes||0;
+    // Build detailed node table if we have health info
+    let detailHtml='';
+    if(details.length){
+      detailHtml=`<table class="table" style="margin-top:8px"><thead><tr><th>#</th><th>节点名称</th><th>端口</th><th>健康状态</th><th>延迟</th><th>失败次数</th><th>错误</th></tr></thead><tbody>`;
+      for(const n of details){
+        const h=n.health||'unknown';
+        const cls=h==='healthy'?'online':(h==='unhealthy'||n.isolated?'error':'warn');
+        const latency=n.latency_ms?n.latency_ms+'ms':'-';
+        const err=n.last_error?esc(String(n.last_error).slice(0,40)):'-';
+        detailHtml+=`<tr><td>${n.index}</td><td style="font-size:12px">${esc(n.name||'')}</td><td><code>${n.port||'-'}</code></td><td><span class="status ${cls}"><i></i>${h}</span></td><td style="font-size:12px">${latency}</td><td style="font-size:12px">${n.failures||0}</td><td style="font-size:11px;color:var(--muted);max-width:200px;overflow:hidden;text-overflow:ellipsis">${err}</td></tr>`;
+      }
+      detailHtml+='</tbody></table>';
+    }else{
+      const nodeHtml=nodes.length?nodes.map((n,i)=>`<div style="display:inline-block;margin:2px;padding:2px 10px;background:var(--bg-alt);border-radius:4px;font-size:12px">${esc(n)}</div>`).join(''):'';
+      detailHtml=`<div style="margin-top:8px">${nodeHtml||'<span style="color:var(--muted)">无</span>'}</div>`;
+    }
+    const healthBadge=isolatedCount>0?`<span style="color:var(--danger);font-size:12px;margin-left:8px">${isolatedCount} 个隔离</span>`:(healthyCount>0?`<span style="color:var(--success);font-size:12px;margin-left:8px">${healthyCount} 个健康</span>`:'');
     $('proxyStatus').innerHTML=`
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
-        <div><span style="color:var(--muted);font-size:12px">状态</span><br><span class="status online"><i></i>运行中</span></div>
+        <div><span style="color:var(--muted);font-size:12px">状态</span><br><span class="status online"><i></i>运行中</span>${healthBadge}</div>
         <div><span style="color:var(--muted);font-size:12px">节点数量</span><br><span style="font-size:18px;font-weight:700">${info.node_count||0}</span></div>
         <div><span style="color:var(--muted);font-size:12px">本地端口</span><br><code>${info.local_port||'-'}</code></div>
         <div><span style="color:var(--muted);font-size:12px">订阅地址</span><br><code style="word-break:break-all;font-size:11px">${esc(info.subscription||'-')}</code></div>
       </div>
       <div style="margin-top:12px">
-        <span style="color:var(--muted);font-size:12px">节点列表 (${nodes.length})</span>
-        <div style="margin-top:8px">${nodeHtml||'<span style="color:var(--muted)">无</span>'}</div>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:var(--muted);font-size:12px">节点列表 (${nodes.length})</span>
+          <button class="btn" style="font-size:12px;padding:4px 12px" onclick="proxyHealthCheck()"><i data-lucide="activity" style="width:12px;height:12px"></i> 健康检查</button>
+        </div>
+        ${detailHtml}
       </div>`;
+    if(window.lucide)lucide.createIcons();
   }catch(e){$('proxyStatus').innerHTML='<div class="empty" style="text-align:center;padding:24px;color:var(--danger)">'+e.message+'</div>';}
 }
 async function proxyAdd(){
@@ -1519,6 +1542,14 @@ async function proxyStop(){
   if(!confirm('确定停止 sing-box 代理？'))return;
   try{await api('/api/admin/proxy-pool',{method:'DELETE'});showNotice('sing-box 已停止','success');loadProxies();}
   catch(e){showNotice(e.message,'error');}
+}
+async function proxyHealthCheck(){
+  try{
+    showNotice('正在执行节点健康检查...','info');
+    await api('/api/admin/proxy-pool',{method:'PUT'});
+    showNotice('健康检查已触发，请稍后刷新查看结果','success');
+    setTimeout(()=>loadProxies(),3000);
+  }catch(e){showNotice(e.message,'error');}
 }
 
 async function loadModelTest(){

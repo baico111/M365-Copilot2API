@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"context"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -35,6 +36,12 @@ const (
 	envLocalPort     = "M365_SINGBOX_LOCAL_PORT"
 	defaultLocalPort = 11080
 	defaultBinary    = "sing-box"
+
+	// Health check constants.
+	healthCheckInterval = 60 * time.Second  // check every 60s
+	healthCheckTimeout  = 10 * time.Second  // per-node check timeout
+	healthMaxFailures   = 3                  // consecutive failures before isolating
+	healthCheckURL      = "https://www.gstatic.com/generate_204"
 )
 
 var (
@@ -45,6 +52,8 @@ var (
 	sbNodeClients map[int]*Clients // per-node clients: node index → Clients
 	sbNodeList    []string         // node names for status reporting
 	sbNodePorts   map[int]int      // node index → local SOCKS5 port
+	sbNodeHealth  map[int]*nodeHealth // per-node health state
+	sbHealthStop  chan struct{}       // stop signal for health check goroutine
 )
 
 func defaultSingBoxConfig() *SingBoxConfig {
@@ -90,7 +99,8 @@ func ConfigureSingBox(subscriptionURL string) error {
 		return fmt.Errorf("sing-box: write config: %w", err)
 	}
 
-	// Stop existing process and clear stale clients
+	// Stop existing process, health checks, and clear stale clients
+	stopHealthChecks()
 	sbMu.Lock()
 	if sbProcess != nil && sbProcess.Process != nil {
 		_ = sbProcess.Process.Signal(os.Interrupt)
@@ -100,6 +110,7 @@ func ConfigureSingBox(subscriptionURL string) error {
 	sbClients = nil
 	sbNodeClients = nil
 	sbNodePorts = nil
+	sbNodeHealth = nil
 	sbMu.Unlock()
 
 	// Start sing-box
@@ -134,6 +145,12 @@ func ConfigureSingBox(subscriptionURL string) error {
 		nodePorts[i] = port
 	}
 
+	// Initialize per-node health state
+	nodeHealthMap := make(map[int]*nodeHealth, len(selected))
+	for i := range selected {
+		nodeHealthMap[i] = newNodeHealth()
+	}
+
 	sbMu.Lock()
 	sbConfig = cfg
 	sbProcess = cmd
@@ -142,7 +159,11 @@ func ConfigureSingBox(subscriptionURL string) error {
 	sbClients = buildLocalSOCKS5Clients(cfg.LocalPort)
 	sbNodeClients = nodeClients
 	sbNodePorts = nodePorts
+	sbNodeHealth = nodeHealthMap
 	sbMu.Unlock()
+
+	// Start background health checks
+	startHealthChecks()
 
 	log.Printf("[sing-box] started with %d nodes on port %d (per-node ports %d-%d)", len(selected), cfg.LocalPort, cfg.LocalPort+1, cfg.LocalPort+len(selected))
 
@@ -161,6 +182,7 @@ func ConfigureSingBox(subscriptionURL string) error {
 		sbClients = nil
 		sbNodeClients = nil
 		sbNodePorts = nil
+		sbNodeHealth = nil
 		sbMu.Unlock()
 	}()
 
@@ -175,6 +197,7 @@ func StopSingBox() {
 }
 
 func stopSingBox() {
+	stopHealthChecks()
 	sbMu.Lock()
 	defer sbMu.Unlock()
 	if sbProcess != nil && sbProcess.Process != nil {
@@ -185,6 +208,7 @@ func stopSingBox() {
 	sbClients = nil
 	sbNodeClients = nil
 	sbNodePorts = nil
+	sbNodeHealth = nil
 }
 
 func refreshLoop(cfg *SingBoxConfig) {
@@ -235,10 +259,12 @@ func refreshLoop(cfg *SingBoxConfig) {
 		// Build per-node clients for the refreshed node set
 		nodeClients := make(map[int]*Clients, len(selected))
 		nodePorts := make(map[int]int, len(selected))
+		nodeHealthMap := make(map[int]*nodeHealth, len(selected))
 		for i := range selected {
 			port := cfg.LocalPort + 1 + i
 			nodeClients[i] = buildLocalSOCKS5Clients(port)
 			nodePorts[i] = port
+			nodeHealthMap[i] = newNodeHealth()
 		}
 		// New process is ready — kill old one
 		sbMu.Lock()
@@ -248,7 +274,10 @@ func refreshLoop(cfg *SingBoxConfig) {
 		sbClients = buildLocalSOCKS5Clients(cfg.LocalPort)
 		sbNodeClients = nodeClients
 		sbNodePorts = nodePorts
+		sbNodeHealth = nodeHealthMap
 		sbMu.Unlock()
+		// Restart health checks for the new node set
+		startHealthChecks()
 		if oldCmd != nil && oldCmd.Process != nil {
 			_ = oldCmd.Process.Signal(os.Interrupt)
 			_ = oldCmd.Process.Kill()
@@ -263,6 +292,7 @@ func refreshLoop(cfg *SingBoxConfig) {
 				sbClients = nil
 				sbNodeClients = nil
 				sbNodePorts = nil
+				sbNodeHealth = nil
 			}
 			sbMu.Unlock()
 		}(reloadCmd)
@@ -769,6 +799,177 @@ func selectRandomNodes(nodes []vlessNode, max int) []vlessNode {
 	return selected
 }
 
+// ---- Node health checking ----
+
+// nodeHealth tracks the health state of a single sing-box node.
+type nodeHealth struct {
+	mu           sync.Mutex
+	health       string        // "healthy", "unhealthy", "checking"
+	failures     int           // consecutive failure count
+	latency      time.Duration // last measured latency
+	lastCheck    time.Time     // last check time
+	lastError    string        // last error message
+	isolated     bool          // true when node is skipped due to failures
+	isolatedAt   time.Time     // when isolation started
+}
+
+// newnodeHealth creates a nodeHealth with default healthy state.
+func newNodeHealth() *nodeHealth {
+	return &nodeHealth{
+		health: "checking",
+	}
+}
+
+// startHealthChecks launches a background goroutine that periodically
+// checks each node's SOCKS5 port connectivity and upstream reachability.
+// Nodes that fail healthMaxFailures consecutive checks are isolated
+// (skipped by SingBoxNodeClient) so requests only go to healthy nodes.
+// Isolated nodes are re-checked; if they recover, they are reactivated.
+func startHealthChecks() {
+	stop := make(chan struct{})
+	sbMu.Lock()
+	if sbHealthStop != nil {
+		close(sbHealthStop)
+	}
+	sbHealthStop = stop
+	sbMu.Unlock()
+
+	go func(stop chan struct{}) {
+		ticker := time.NewTicker(healthCheckInterval)
+		defer ticker.Stop()
+		// Initial check after 5s (let sing-box fully start).
+		select {
+		case <-stop:
+			return
+		case <-time.After(5 * time.Second):
+		}
+		checkAllNodes()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				checkAllNodes()
+			}
+		}
+	}(stop)
+}
+
+// stopHealthChecks signals the health check goroutine to stop.
+func stopHealthChecks() {
+	sbMu.Lock()
+	if sbHealthStop != nil {
+		close(sbHealthStop)
+		sbHealthStop = nil
+	}
+	sbMu.Unlock()
+}
+
+// checkAllNodes runs a health check against every node concurrently.
+func checkAllNodes() {
+	sbMu.Lock()
+	nodes := make([]int, 0, len(sbNodeClients))
+	for idx := range sbNodeClients {
+		nodes = append(nodes, idx)
+	}
+	sbMu.Unlock()
+	if len(nodes) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	for _, idx := range nodes {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			checkNodeHealth(idx)
+		}(idx)
+	}
+	wg.Wait()
+}
+
+// checkNodeHealth checks a single node's SOCKS5 port by attempting an
+// HTTP GET to healthCheckURL through the node's SOCKS5 proxy. On success,
+// the node is marked healthy. On failure, the failure counter increments
+// and the node is isolated after healthMaxFailures consecutive failures.
+func checkNodeHealth(idx int) {
+	sbMu.Lock()
+	clients, ok := sbNodeClients[idx]
+	port := sbNodePorts[idx]
+	nh, nhOk := sbNodeHealth[idx]
+	sbMu.Unlock()
+	if !ok || clients == nil || !nhOk || nh == nil {
+		return
+	}
+
+	nh.mu.Lock()
+	nh.health = "checking"
+	nh.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthCheckURL, nil)
+	if err != nil {
+		recordNodeFailure(idx, err)
+		return
+	}
+
+	start := time.Now()
+	resp, err := clients.HTTP.Do(req)
+	latency := time.Since(start)
+
+	if err != nil {
+		recordNodeFailure(idx, err)
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		recordNodeFailure(idx, fmt.Errorf("health check returned %d", resp.StatusCode))
+		return
+	}
+
+	// Success — mark healthy and clear failures.
+	nh.mu.Lock()
+	nh.health = "healthy"
+	nh.failures = 0
+	nh.latency = latency
+	nh.lastCheck = time.Now()
+	nh.lastError = ""
+	if nh.isolated {
+		log.Printf("[sing-box] node %d (port %d) recovered, latency=%s", idx, port, latency)
+		nh.isolated = false
+		nh.isolatedAt = time.Time{}
+	}
+	nh.mu.Unlock()
+}
+
+// recordNodeFailure records a failed health check for a node and isolates
+// it after too many consecutive failures.
+func recordNodeFailure(idx int, err error) {
+	sbMu.Lock()
+	nh, ok := sbNodeHealth[idx]
+	port := sbNodePorts[idx]
+	sbMu.Unlock()
+	if !ok || nh == nil {
+		return
+	}
+	nh.mu.Lock()
+	nh.failures++
+	nh.lastCheck = time.Now()
+	nh.lastError = err.Error()
+	if nh.failures >= healthMaxFailures && !nh.isolated {
+		nh.isolated = true
+		nh.isolatedAt = time.Now()
+		nh.health = "unhealthy"
+		log.Printf("[sing-box] node %d (port %d) isolated after %d failures: %s", idx, port, nh.failures, err.Error())
+	} else if !nh.isolated {
+		nh.health = "unhealthy"
+		log.Printf("[sing-box] node %d (port %d) check failed (%d/%d): %s", idx, port, nh.failures, healthMaxFailures, err.Error())
+	}
+	nh.mu.Unlock()
+}
+
 // ---- Public API (replaces old proxy pool) ----
 
 // SingBoxStatus returns info about the running sing-box instance.
@@ -778,13 +979,57 @@ func SingBoxStatus() []map[string]any {
 	if sbConfig == nil {
 		return []map[string]any{}
 	}
+
+	nodes := make([]map[string]any, 0, len(sbNodeList))
+	for i, name := range sbNodeList {
+		node := map[string]any{
+			"index": i,
+			"name":  name,
+			"port":  sbNodePorts[i],
+		}
+		if nh, ok := sbNodeHealth[i]; ok && nh != nil {
+			nh.mu.Lock()
+			node["health"] = nh.health
+			node["failures"] = nh.failures
+			node["latency_ms"] = nh.latency.Milliseconds()
+			node["last_check"] = nh.lastCheck
+			node["last_error"] = nh.lastError
+			node["isolated"] = nh.isolated
+			nh.mu.Unlock()
+		} else {
+			node["health"] = "unknown"
+			node["failures"] = 0
+			node["latency_ms"] = int64(0)
+			node["isolated"] = false
+		}
+		nodes = append(nodes, node)
+	}
+
+	// Count healthy vs isolated.
+	healthy := 0
+	isolated := 0
+	for _, nh := range sbNodeHealth {
+		if nh != nil {
+			nh.mu.Lock()
+			if nh.isolated {
+				isolated++
+			} else if nh.health == "healthy" {
+				healthy++
+			}
+			nh.mu.Unlock()
+		}
+	}
+
 	status := []map[string]any{
 		{
-			"subscription": sbConfig.SubscriptionURL,
-			"local_port":   sbConfig.LocalPort,
-			"binary":       sbConfig.BinaryPath,
-			"node_count":   len(sbNodeList),
-			"nodes":        sbNodeList,
+			"subscription":   sbConfig.SubscriptionURL,
+			"local_port":     sbConfig.LocalPort,
+			"binary":         sbConfig.BinaryPath,
+			"node_count":     len(sbNodeList),
+			"nodes":          sbNodeList,
+			"node_details":   nodes,
+			"healthy_nodes":  healthy,
+			"isolated_nodes": isolated,
 		},
 	}
 	return status
@@ -797,21 +1042,52 @@ func SingBoxRunning() bool {
 	return sbProcess != nil
 }
 
-// SingBoxNodeCount returns the number of available per-node clients.
+// SingBoxHealthCheck triggers an immediate health check of all nodes.
+// Returns immediately; the checks run in the background.
+func SingBoxHealthCheck() {
+	go checkAllNodes()
+}
+
+// SingBoxNodeCount returns the number of available (non-isolated) per-node clients.
 func SingBoxNodeCount() int {
 	sbMu.Lock()
 	defer sbMu.Unlock()
-	return len(sbNodeClients)
+	count := 0
+	for idx, nh := range sbNodeHealth {
+		if _, ok := sbNodeClients[idx]; !ok {
+			continue
+		}
+		if nh == nil || !nh.isolated {
+			count++
+		}
+	}
+	return count
 }
 
 // SingBoxNodeClient returns the Clients for a specific node index.
-// Falls back to the main urltest clients if the index is out of range.
+// Skips isolated (unhealthy) nodes and falls back to the next available.
+// Falls back to the main urltest clients if no healthy node is found.
 func SingBoxNodeClient(index int) *Clients {
 	sbMu.Lock()
 	defer sbMu.Unlock()
-	if c, ok := sbNodeClients[index]; ok {
-		return c
+	if sbNodeClients == nil {
+		return sbClients
 	}
+	n := len(sbNodeClients)
+	if n == 0 {
+		return sbClients
+	}
+	// Try the requested index first, then scan for any healthy node.
+	for i := 0; i < n; i++ {
+		idx := (index + i) % n
+		if c, ok := sbNodeClients[idx]; ok {
+			nh := sbNodeHealth[idx]
+			if nh == nil || !nh.isolated {
+				return c
+			}
+		}
+	}
+	// All nodes isolated — return the main urltest client as fallback.
 	return sbClients
 }
 

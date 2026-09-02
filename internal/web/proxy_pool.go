@@ -43,6 +43,10 @@ func (s *Server) proxyPool(w http.ResponseWriter, r *http.Request) {
 		// Stop sing-box
 		outbound.StopSingBox()
 		jsonOut(w, map[string]any{"ok": true, "proxies": []map[string]any{}})
+	case http.MethodPut:
+		// Trigger immediate health check of all nodes
+		outbound.SingBoxHealthCheck()
+		jsonOut(w, map[string]any{"ok": true, "message": "health check triggered"})
 	default:
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 	}
