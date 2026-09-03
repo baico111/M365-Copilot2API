@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -94,16 +95,25 @@ func knownUpstreamTones() []string {
 }
 
 var (
-	dynamicTones []string
-	dynamicMu    sync.RWMutex
-	dynamicAt    time.Time
+	dynamicTones   []string
+	dynamicMu      sync.RWMutex
+	dynamicAt      time.Time
+	dynamicSyncing atomic.Bool
 )
 
 func liveUpstreamTones() []string {
 	dynamicMu.RLock()
 	if dynamicAt.IsZero() || time.Since(dynamicAt) > 24*time.Hour {
 		dynamicMu.RUnlock()
-		go syncUpstreamTones()
+		// Single-flight: without the CAS guard every request that observed a
+		// cold/stale cache spawned its own scraper, hammering the CDN in
+		// parallel on cold start (multi-tenant traffic amplification).
+		if dynamicSyncing.CompareAndSwap(false, true) {
+			go func() {
+				defer dynamicSyncing.Store(false)
+				syncUpstreamTones()
+			}()
+		}
 		dynamicMu.RLock()
 	}
 	t := dynamicTones

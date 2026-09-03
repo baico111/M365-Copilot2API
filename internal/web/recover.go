@@ -35,6 +35,14 @@ func (w *streamingWriter) Flush() {
 	}
 }
 
+// Unwrap exposes the underlying ResponseWriter to http.NewResponseController
+// so ResponseController.SetWriteDeadline (used by every SSE writer) can walk
+// through this middleware chain. Without it the 30s per-frame write deadline
+// silently returned ErrNotSupported and a dead/flow-controlled client could
+// pin a handler goroutine, its sseWriter mutex and an account concurrency
+// slot forever.
+func (w *streamingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // recoverPanics 捕获 handler panic，已开始流式时不写错误体，否则返回 JSON 500。
 func recoverPanics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

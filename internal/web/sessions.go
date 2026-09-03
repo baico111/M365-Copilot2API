@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -29,7 +30,11 @@ type sessionStore struct {
 }
 
 func openSessionStore() *sessionStore {
-	path := os.Getenv("M365_SESSION_CACHE")
+	// M365_SESSION_CACHE belongs to sessionResolver (sessions.json, a JSON
+	// array). This legacy store is a JSON object — sharing the file would
+	// make the two writers clobber each other on every flush, silently
+	// wiping one side's bindings after restart.
+	path := os.Getenv("M365_SESSION_BINDINGS")
 	if path == "" {
 		path = filepath.Join(os.TempDir(), "m365-copilot2api-sessions.json")
 	}
@@ -101,6 +106,27 @@ func (s *sessionStore) delete(id string) bool {
 	return true
 }
 
+// removeByConversation drops every legacy session_key binding pointing at a
+// cloud conversation that was deleted; a stale binding would pin requests to
+// a dead conversation and surface as 502/empty upstream responses.
+func (s *sessionStore) removeByConversation(convID string) {
+	if convID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for k, v := range s.data {
+		if v.ConversationID == convID {
+			delete(s.data, k)
+			changed = true
+		}
+	}
+	if changed {
+		s.persist.markDirty()
+	}
+}
+
 type userSession struct {
 	ConversationID string    `json:"conversationId"`
 	SessionID      string    `json:"sessionId"`
@@ -163,6 +189,14 @@ func (s *userSessionStore) evictLocked() {
 // conversation. The stored key is opaque and never returned to a caller.
 func userKey(tenant, user string) string { return tenant + "\x00" + user }
 
+// sessionScope namespaces the legacy client-supplied `sessionKey` by tenant.
+// Without the prefix two API keys that pass the same session_key string hit
+// the same record, and the AccountID/ConversationID pinned inside it route
+// requests straight into the other tenant's cloud conversation.
+func sessionScope(r *http.Request, sessionKey string) string {
+	return tenantFromRequest(r) + "\x00" + sessionKey
+}
+
 func (s *userSessionStore) Get(tenant, user string) (userSession, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -210,4 +244,26 @@ func (s *userSessionStore) ActiveConversations(window time.Duration) map[string]
 		}
 	}
 	return out
+}
+
+// RemoveByConversation drops every user→session binding that points at the
+// given cloud conversation. Called when the conversation is deleted (admin or
+// auto-cleanup) so the next request cannot resume a dead conversation and get
+// upstream errors that surface as 502/empty replies.
+func (s *userSessionStore) RemoveByConversation(convID string) {
+	if convID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for k, v := range s.data {
+		if v.ConversationID == convID {
+			delete(s.data, k)
+			changed = true
+		}
+	}
+	if changed {
+		s.persist.markDirty()
+	}
 }

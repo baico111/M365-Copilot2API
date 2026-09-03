@@ -43,6 +43,7 @@ func openDebugStore() *debugStore {
 	}
 	return &debugStore{path: p}
 }
+
 var sensitiveKeys = map[string]bool{
 	"api_key": true, "apikey": true, "accesstoken": true, "authorization": true,
 	"access_token": true, "refreshtoken": true, "refresh_token": true,
@@ -184,6 +185,10 @@ func (c *captureWriter) Flush() {
 	}
 }
 func (c *captureWriter) Header() http.Header { return c.ResponseWriter.Header() }
+
+// Unwrap lets http.NewResponseController reach the real writer so the SSE
+// handlers' SetWriteDeadline calls actually take effect through this layer.
+func (c *captureWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
 func (c *captureWriter) Write(b []byte) (int, error) {
 	if c.status == 0 {
 		c.status = 200

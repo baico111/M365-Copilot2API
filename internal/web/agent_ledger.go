@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -55,7 +56,20 @@ func compactToolResult(s string, limit int) string {
 	if tail < 80 {
 		tail = 80
 	}
-	return s[:head] + fmt.Sprintf("\n... [truncated %d bytes] ...\n", len(s)-head-tail) + s[len(s)-tail:]
+	// Do not split a multi-byte rune at either boundary: truncated CJK tool
+	// output produced invalid UTF-8 that json.Marshal silently mangles into
+	// U+FFFD, corrupting ledger evidence the router must match on.
+	for head > 0 && !utf8.RuneStart(s[head]) {
+		head--
+	}
+	cut := len(s) - tail
+	if cut < 0 {
+		cut = 0
+	}
+	for cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut++
+	}
+	return s[:head] + fmt.Sprintf("\n... [truncated %d bytes] ...\n", len(s)-head-cut) + s[cut:]
 }
 
 // scopedCallID returns a globally unique tool call id. The scope parameters

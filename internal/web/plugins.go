@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -15,7 +16,7 @@ type pluginCacheEntry struct {
 }
 
 type pluginCache struct {
-	mu    sync.Mutex
+	mu      sync.Mutex
 	entries map[string]pluginCacheEntry
 }
 
@@ -39,8 +40,8 @@ func (pc *pluginCache) set(accountID string, data json.RawMessage) {
 	pc.entries[accountID] = pluginCacheEntry{data: data, fetchedAt: time.Now()}
 }
 
-func (s *Server) fetchPlugins(accessToken string) (json.RawMessage, error) {
-	req, err := http.NewRequest(http.MethodGet, "https://substrate.office.com/m365Copilot/EventListener/Client?EventId=ExecuteAction", nil)
+func (s *Server) fetchPlugins(ctx context.Context, accessToken string) (json.RawMessage, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://substrate.office.com/m365Copilot/EventListener/Client?EventId=ExecuteAction", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +85,9 @@ func (s *Server) plugins(w http.ResponseWriter, r *http.Request) {
 		w.Write(cached)
 		return
 	}
-	data, err := s.fetchPlugins(acc.AccessToken)
+	pctx, pcancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer pcancel()
+	data, err := s.fetchPlugins(pctx, acc.AccessToken)
 	if err != nil {
 		writeUpstreamError(w, err)
 		return

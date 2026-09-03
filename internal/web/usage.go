@@ -71,7 +71,37 @@ func (s *usageLog) load() {
 			s.records = append(s.records, rec)
 		}
 	}
+	trimmed := len(s.records) > maxUsageRecords
 	s.trim()
+	// The append-only jsonl previously grew forever (every byte since the
+	// first boot) while only the last 50k records were kept in memory. Compact
+	// the file once on startup so disk usage matches the bounded window.
+	if trimmed {
+		s.rewrite()
+	}
+}
+
+func (s *usageLog) rewrite() {
+	s.mu.Lock()
+	recs := append([]UsageRecord(nil), s.records...)
+	s.mu.Unlock()
+	var buf []byte
+	for _, rec := range recs {
+		if b, err := json.Marshal(rec); err == nil {
+			buf = append(buf, b...)
+			buf = append(buf, '\n')
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(s.Path), 0700); err != nil {
+		return
+	}
+	tmp := s.Path + ".compact.tmp"
+	if err := os.WriteFile(tmp, buf, 0600); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, s.Path); err != nil {
+		_ = os.Remove(tmp)
+	}
 }
 
 func (s *usageLog) trim() {
@@ -117,6 +147,8 @@ func (s *usageLog) flush() error {
 		s.mu.Unlock()
 		return err
 	}
+	// fsync failure: bytes are already in the file (will persist unless the
+	// machine dies), records are NOT re-queued to avoid duplicate appends.
 	return f.Sync()
 }
 

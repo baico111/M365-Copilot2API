@@ -29,15 +29,15 @@ type CacheStats struct {
 }
 
 type statsSnapshot struct {
-	TotalRequests  int64         `json:"total_requests"`
-	CacheHits      int64         `json:"cache_hits"`
-	CacheMisses    int64         `json:"cache_misses"`
-	TokensSent     int64         `json:"tokens_sent"`
-	TokensSaved    int64         `json:"tokens_saved"`
-	ActiveSessions int           `json:"active_sessions"`
-	MaxSessionAge  time.Duration `json:"max_session_age"`
-	HitRate        float64       `json:"hit_rate"`
-	SavingsPercent float64       `json:"savings_percent"`
+	TotalRequests  int64               `json:"total_requests"`
+	CacheHits      int64               `json:"cache_hits"`
+	CacheMisses    int64               `json:"cache_misses"`
+	TokensSent     int64               `json:"tokens_sent"`
+	TokensSaved    int64               `json:"tokens_saved"`
+	ActiveSessions int                 `json:"active_sessions"`
+	MaxSessionAge  time.Duration       `json:"max_session_age"`
+	HitRate        float64             `json:"hit_rate"`
+	SavingsPercent float64             `json:"savings_percent"`
 	KeyStats       map[string]*KeyStat `json:"key_stats"`
 }
 
@@ -97,6 +97,11 @@ func (s *CacheStats) RecordRequest(apiKey string, hit bool, tokensSent, tokensSa
 
 	ks, ok := s.KeyStats[apiKey]
 	if !ok {
+		// Cap per-key tracking so callers cannot grow the map (and the
+		// persisted stats.json) without bound by rotating keys/headers.
+		if len(s.KeyStats) >= 4096 {
+			s.pruneKeyStatsLocked(1024)
+		}
 		ks = &KeyStat{APIKey: apiKey}
 		s.KeyStats[apiKey] = ks
 	}
@@ -113,6 +118,20 @@ func (s *CacheStats) RecordRequest(apiKey string, hit bool, tokensSent, tokensSa
 		ks.HitRate = float64(ks.CacheHits) / float64(ks.TotalRequests) * 100
 	}
 	s.persist.markDirty()
+}
+
+func (s *CacheStats) pruneKeyStatsLocked(remove int) {
+	for remove > 0 && len(s.KeyStats) > 0 {
+		var oldestKey string
+		var oldest time.Time
+		for k, v := range s.KeyStats {
+			if oldestKey == "" || v.LastUsed.Before(oldest) {
+				oldestKey, oldest = k, v.LastUsed
+			}
+		}
+		delete(s.KeyStats, oldestKey)
+		remove--
+	}
 }
 
 func (s *CacheStats) GetStats() statsSnapshot {

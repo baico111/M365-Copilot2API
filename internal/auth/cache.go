@@ -323,8 +323,7 @@ func (s *Store) Path() string { return s.path }
 
 func (s *Store) saveLocked() error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		if filepath.Dir(s.path) != "/" && filepath.Dir(s.path) != "." {
-		}
+		return err
 	}
 	encData := Cache{Accounts: make([]AccountToken, len(s.data.Accounts))}
 	for i, a := range s.data.Accounts {
@@ -652,9 +651,9 @@ type TokenRefreshResult struct {
 // The entire accounts array is encrypted as a single AES-GCM ciphertext
 // using a key derived from the user-supplied password.
 type BackupData struct {
-	Version   int             `json:"version"`
-	CreatedAt time.Time       `json:"createdAt"`
-	Encrypted string          `json:"encrypted"` // base64(AES-GCM(accountsJSON))
+	Version   int       `json:"version"`
+	CreatedAt time.Time `json:"createdAt"`
+	Encrypted string    `json:"encrypted"` // base64(AES-GCM(accountsJSON))
 }
 
 // ExportAccounts creates a password-encrypted backup of all accounts.

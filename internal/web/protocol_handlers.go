@@ -117,6 +117,15 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	r2.Body = io.NopCloser(bytes.NewReader(b))
 	r2.ContentLength = int64(len(b))
 	pr, pw := io.Pipe()
+	// Close both pipe ends unconditionally on return: when the client
+	// disconnects the scan loop exits early, and without this the inner
+	// openaiChat goroutine blocks forever on pw.Write into a pipe nobody
+	// reads — leaking a goroutine, its ChatHub websocket, and the account
+	// concurrency slot (which eventually starves the pool into 502/429s).
+	defer func() {
+		_ = pr.Close()
+		_ = pw.Close()
+	}()
 	irw := &pipeResponseWriter{h: make(http.Header), w: pw}
 	innerDone := make(chan struct{})
 	go func() {
@@ -135,19 +144,39 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("X-Accel-Buffering", "no")
 	flusher, _ := w.(http.Flusher)
 	sw := newSSEWriter(w, flusher)
+	// emit must go through the sseWriter mutex: the keepalive goroutine below
+	// writes on the same ResponseWriter, and un-synchronized interleaved
+	// writes corrupt event/data line pairs for strict clients (Codex).
 	emit := func(name string, v any) error {
-		return writeSSE(r, w, flusher, name, v)
+		return sw.event(name, v)
 	}
 	id := "resp_" + uuid.NewString()
 	created := time.Now().Unix()
 	emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
+
+	var text strings.Builder
+	messageID := "msg_" + uuid.NewString()
+	contentID := "txt_" + uuid.NewString()
+	textStarted := false
+	// index 0 is permanently reserved for the assistant message item so tool
+	// output_index values can never collide with it, regardless of whether
+	// narration text or tool calls arrive first.
+	messageItem := map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}
+	emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": messageItem})
+	toolIndex := func(idx int) int { return idx + 1 }
 
 	// Keepalive heartbeat: when the upstream ChatHub takes a long time to
 	// produce the next token (e.g. tool execution, long reasoning), reverse
 	// proxies (nginx/Cloudflare) and clients may time out. A 15s SSE comment
 	// keeps the connection alive without emitting any data event.
 	keepaliveDone := make(chan struct{})
+	keepaliveExited := make(chan struct{})
+	defer func() {
+		close(keepaliveDone)
+		<-keepaliveExited // never let the goroutine write after we return
+	}()
 	go func() {
+		defer close(keepaliveExited)
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -161,12 +190,6 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 	}()
-	defer close(keepaliveDone)
-
-	var text strings.Builder
-	messageID := "msg_" + uuid.NewString()
-	contentID := "txt_" + uuid.NewString()
-	textStarted := false
 	type tcState struct {
 		ID, Name, Args, Type string
 		ItemID               string
@@ -174,16 +197,35 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 	calls := map[int]*tcState{}
 	scanner := bufio.NewScanner(pr)
 	scanner.Buffer(make([]byte, 4096), 2<<20)
+	sawDone := false
+	sawErr := ""
 	for scanner.Scan() {
 		if r.Context().Err() != nil {
 			return
 		}
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		if line == "data: [DONE]" {
+			sawDone = true
 			continue
 		}
 		var chunk map[string]any
 		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk) != nil {
+			continue
+		}
+		// The inner layer signals unrecoverable problems (content policy,
+		// rate limit, empty completion) as an error-only frame. Without this
+		// check they fall through `if len(choices)==0 { continue }` and the
+		// adapter used to close with response.completed, persisting a
+		// truncated answer as if it were finished.
+		if e, ok := chunk["error"].(map[string]any); ok {
+			msg, _ := e["message"].(string)
+			if msg == "" {
+				msg = "upstream stream reported an error"
+			}
+			sawErr = msg
 			continue
 		}
 		choices, _ := chunk["choices"].([]any)
@@ -194,10 +236,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		delta, _ := choice["delta"].(map[string]any)
 		if content, ok := delta["content"].(string); ok && content != "" {
 			text.WriteString(content)
-			if !textStarted {
-				textStarted = true
-				emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}})
-			}
+			textStarted = true
 			emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": content})
 		}
 		if rawCalls, ok := delta["tool_calls"].([]any); ok {
@@ -239,18 +278,18 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 						st = &tcState{ItemID: prefix + uuid.NewString(), ID: callID, Name: name, Args: args, Type: typ}
 						calls[idx] = st
 						item["id"] = st.ItemID
-						emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
+						emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": toolIndex(idx), "item": item})
 					} else {
 						item := map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": "", "status": "in_progress"}
 						st = &tcState{ItemID: prefix + uuid.NewString(), ID: callID, Name: name, Args: args, Type: typ}
 						calls[idx] = st
 						item["id"] = st.ItemID
-						emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": idx, "item": item})
+						emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": toolIndex(idx), "item": item})
 						// If the first chunk already carries arguments, emit them
 						// as a delta so conforming clients can reconstruct the
 						// full JSON (added only has an empty string).
 						if args != "" {
-							emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": args})
+							emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": toolIndex(idx), "item_id": st.ItemID, "delta": args})
 						}
 					}
 				} else {
@@ -264,7 +303,7 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 					if chunkArgs != "" {
 						st.Args += chunkArgs
 						if st.Type != "custom" {
-							emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": idx, "item_id": st.ItemID, "delta": chunkArgs})
+							emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "output_index": toolIndex(idx), "item_id": st.ItemID, "delta": chunkArgs})
 						}
 					}
 				}
@@ -272,35 +311,55 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 	<-innerDone
-	if scanner.Err() != nil || irw.status >= http.StatusBadRequest {
-		status := irw.status
-		if status == 0 {
-			status = http.StatusBadGateway
-		}
+	failStream := func(code string, msg string) {
 		emit("response.failed", map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
 				"id": id, "object": "response", "status": "failed", "model": model,
-				"error": map[string]any{"code": status, "message": "inner chat request failed"},
+				"error": map[string]any{"code": code, "message": msg},
 			},
 		})
+	}
+	switch {
+	case scanner.Err() != nil:
+		failStream(fmt.Sprint(http.StatusBadGateway), "upstream stream interrupted: "+scanner.Err().Error())
+		return
+	case irw.status >= http.StatusBadRequest:
+		failStream(fmt.Sprint(irw.status), "inner chat request failed")
+		return
+	case sawErr != "":
+		// An error-only frame arrived after (possibly partial) text: the
+		// answer is NOT complete; fail instead of persisting a truncated
+		// response as a successful one.
+		failStream("upstream_error", sawErr)
+		return
+	case !sawDone:
+		// Stream ended (EOF) without [DONE]: inner handler panicked or the
+		// pipe broke mid-write. Treat as failed, keep partial text client
+		// side but let it show as incomplete.
+		failStream("incomplete_stream", "upstream stream ended without a completion marker")
 		return
 	}
 	if len(calls) == 0 && strings.TrimSpace(text.String()) == "" {
 		// Never leave a Responses stream after response.created without a
 		// terminal event: clients otherwise render this as a successful blank
 		// answer and may reuse an incomplete response on the next turn.
-		emit("response.failed", map[string]any{
-			"type": "response.failed",
-			"response": map[string]any{
-				"id": id, "object": "response", "status": "failed", "model": model,
-				"error": map[string]any{"code": "empty_upstream_response", "message": "ChatHub returned no text or tool call"},
-			},
-		})
+		failStream("empty_upstream_response", "ChatHub returned no text or tool call")
 		return
 	}
+	// Close the message item first (index 0, already added after created),
+	// then the tool items (index 1+). Clients that received partial
+	// narration text plus tool calls now see both finalized, and the
+	// completed output contains the text instead of silently dropping it.
 	output := []any{}
-	if len(calls) > 0 {
+	messageItem["status"] = "completed"
+	messageItem["content"] = []any{map[string]any{"type": "output_text", "id": contentID, "text": text.String(), "annotations": []any{}}}
+	if textStarted {
+		emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "output_index": 0, "content_index": 0, "item_id": messageID, "text": text.String()})
+	}
+	emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": messageItem})
+	output = append(output, messageItem)
+	{
 		keys := make([]int, 0, len(calls))
 		for k := range calls {
 			keys = append(keys, k)
@@ -311,51 +370,50 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 			if st == nil {
 				continue
 			}
-		// Guard against empty IDs caused by upstream connection drops
-		// (e.g. SOCKS5 proxy silently closing the WebSocket mid-stream).
-		// Clients like Codex/OpenCode reject items with empty id/call_id.
-		if st.ID == "" {
-			st.ID = "call_" + uuid.NewString()
-		}
-		if st.ItemID == "" {
-			if st.Type == "custom" {
-				st.ItemID = "ctc_" + uuid.NewString()
-			} else {
-				st.ItemID = "fc_" + uuid.NewString()
+			// Guard against empty IDs caused by upstream connection drops
+			// (e.g. SOCKS5 proxy silently closing the WebSocket mid-stream).
+			// Clients like Codex/OpenCode reject items with empty id/call_id.
+			if st.ID == "" {
+				st.ID = "call_" + uuid.NewString()
 			}
-		}
-		if st.Name == "" {
-			st.Name = "unknown"
-		}
-		if st.Type == "custom" {
-			input := customToolInput(st.Args)
-			item := map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": input, "status": "completed"}
+			if st.ItemID == "" {
+				if st.Type == "custom" {
+					st.ItemID = "ctc_" + uuid.NewString()
+				} else {
+					st.ItemID = "fc_" + uuid.NewString()
+				}
+			}
+			if st.Name == "" {
+				st.Name = "unknown"
+			}
+			oi := toolIndex(i)
+			if st.Type == "custom" {
+				input := customToolInput(st.Args)
+				item := map[string]any{"type": "custom_tool_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "input": input, "status": "completed"}
+				output = append(output, item)
+				emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": oi, "item_id": item["id"], "delta": input})
+				emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": oi, "item_id": item["id"], "input": input})
+				emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": oi, "item": item})
+				continue
+			}
+			item := map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": st.Args, "status": "completed"}
 			output = append(output, item)
-			emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "output_index": i, "item_id": item["id"], "delta": input})
-			emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "output_index": i, "item_id": item["id"], "input": input})
-			emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
-			continue
+			emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": oi, "item_id": st.ItemID, "arguments": st.Args})
+			emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": oi, "item": item})
 		}
-		item := map[string]any{"type": "function_call", "id": st.ItemID, "call_id": st.ID, "name": st.Name, "arguments": st.Args, "status": "completed"}
-		output = append(output, item)
-		emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "output_index": i, "item_id": st.ItemID, "arguments": st.Args})
-		emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i, "item": item})
-		}
-	} else {
-		item := map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "in_progress", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": "", "annotations": []any{}}}}
-		output = append(output, item)
-		if !textStarted {
-			emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": item})
-			emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "item_id": messageID, "delta": text.String()})
-		}
-		emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "output_index": 0, "content_index": 0, "item_id": messageID, "text": text.String()})
-		item["status"] = "completed"
-		item["content"] = []any{map[string]any{"type": "output_text", "id": contentID, "text": text.String(), "annotations": []any{}}}
-		emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": item})
 	}
 	usageOutput := text.String()
-	for _, call := range calls {
-		usageOutput += call.Name + call.Args
+	{
+		keys := make([]int, 0, len(calls))
+		for k := range calls {
+			keys = append(keys, k)
+		}
+		sort.Ints(keys)
+		for _, i := range keys {
+			if c := calls[i]; c != nil {
+				usageOutput += c.Name + c.Args
+			}
+		}
 	}
 	estimate := estimateResponsesUsage(model, o.Messages, o.Tools, o.ToolChoice, usageOutput)
 	resp := map[string]any{"id": id, "object": "response", "created_at": created, "status": "completed", "model": model, "output": output, "usage": estimate.Values, "m365": localUsageMetadata(estimate.Source)}
@@ -383,6 +441,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body responsesRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 	if json.NewDecoder(r.Body).Decode(&body) != nil {
 		writeResponsesError(w, 400, "invalid_request_error", "bad json")
 		return
@@ -408,6 +467,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	sessionID := responseSessionID(r)
 	nsKey := responseNamespace(tenant, sessionID)
+	var consumedPrior *RespNode // non-nil when previous_response_id was marked consumed
 	if body.PreviousResponseID != "" {
 		toolIDs := extractResponsesToolOutputIDs(body.Input)
 		s.responseMu.Lock()
@@ -465,6 +525,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		}
 		prior.Version++
 		prior.Consumed = true
+		consumedPrior = prior
 		messages := append([]oaiMsg(nil), prior.Messages...)
 		newVersion := prior.Version
 		parentToolCount := len(prior.ToolCalls)
@@ -480,6 +541,19 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, raw, status, err := s.runOpenAIAdapter(r, o)
+	if status >= 400 || err != nil || (status < 400 && err == nil && !responsesOutputHasContent(out)) {
+		// Undo previous_response_id consumption on upstream failure: the
+		// consumer never completed the turn, so a retry with the same id
+		// must stay possible instead of dead-ending in 409 conflicts.
+		if consumedPrior != nil {
+			s.responseMu.Lock()
+			if consumedPrior.Version > 0 {
+				consumedPrior.Version--
+			}
+			consumedPrior.Consumed = false
+			s.responseMu.Unlock()
+		}
+	}
 	if status >= 400 {
 		writeResponsesError(w, status, "upstream_error", errorMessage(raw, "upstream protocol error"))
 		return
@@ -573,8 +647,24 @@ func responsesOutputHasContent(src map[string]any) bool {
 	if calls, ok := msg["tool_calls"].([]any); ok && len(calls) > 0 {
 		return true
 	}
-	text, _ := msg["content"].(string)
-	return strings.TrimSpace(text) != ""
+	switch content := msg["content"].(type) {
+	case string:
+		return strings.TrimSpace(content) != ""
+	case []any:
+		// Multimodal answers (image_url parts) carry no plain string
+		// content; they used to be judged empty → spurious 502 while the
+		// same answer streamed fine.
+		for _, raw := range content {
+			part, _ := raw.(map[string]any)
+			if t, _ := part["text"].(string); strings.TrimSpace(t) != "" {
+				return true
+			}
+			if part["type"] == "image_url" || part["type"] == "image" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
@@ -584,6 +674,7 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body anthropicRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 	if json.NewDecoder(r.Body).Decode(&body) != nil {
 		writeAnthropicError(w, 400, "invalid_request_error", "bad json")
 		return

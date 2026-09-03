@@ -24,7 +24,16 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
+
+// alwaysErrorRoundTripper fails fast for a misconfigured bound proxy so the
+// request errors out at the transport layer instead of silently going direct.
+type alwaysErrorRoundTripper struct{ err error }
+
+func (t alwaysErrorRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, t.err
+}
 
 type pendingPKCE struct {
 	Verifier    string
@@ -182,7 +191,21 @@ func (s *Server) clientForProxy(proxyURL string) *chathub.Client {
 	clients, err := outbound.New(proxyURL)
 	if err != nil {
 		log.Printf("[bound-proxy] invalid proxy %q: %v", proxyURL, err)
-		return s.chat
+		// Never fall back to direct: that breaks the per-account exit-IP
+		// isolation the binding exists for (risking M365 fraud-flag/ban of
+		// the account) and silently ignores the operator's intent. Hand back
+		// a client whose dial always errors so the request fails closed.
+		bad := &chathub.Client{
+			HTTPHeader: s.chat.HTTPHeader,
+			Trace:      s.chat.Trace,
+			Dialer: &websocket.Dialer{
+				NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return nil, fmt.Errorf("bound proxy %q is misconfigured: %w", proxyURL, err)
+				},
+			},
+			HTTPClient: &http.Client{Transport: alwaysErrorRoundTripper{err: fmt.Errorf("bound proxy %q is misconfigured: %w", proxyURL, err)}},
+		}
+		return bad
 	}
 	c := &chathub.Client{
 		HTTPHeader: make(http.Header),
@@ -248,7 +271,8 @@ func New() (*Server, error) {
 		pkce:               map[string]pendingPKCE{},
 		chat: func() *chathub.Client {
 			c := chathub.NewClient()
-			c.Trace = func(meta map[string]any) { fmt.Printf("[multimodal-trace] %s\\n", mustJSON(meta)) }
+			// Literal "\\n" (backslash-n) printed instead of a newline: use \n.
+			c.Trace = func(meta map[string]any) { fmt.Printf("[multimodal-trace] %s\n", mustJSON(meta)) }
 			return c
 		}(),
 		sessions:             openSessionStore(),
@@ -426,7 +450,10 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if s.adminPassword == "" {
+		s.mu.Lock()
+		noPassword := s.adminPassword == ""
+		s.mu.Unlock()
+		if noPassword {
 			writeOpenAIError(w, http.StatusServiceUnavailable, "configuration_error", "administrator password is not configured")
 			return
 		}
@@ -1061,6 +1088,23 @@ func (s *Server) startPKCE(w http.ResponseWriter, _ *http.Request) {
 	state := hex.EncodeToString(b)
 	redirectURI := auth.RedirectURI()
 	s.mu.Lock()
+	// /api/auth/start is unauthenticated; prune expired states and cap the
+	// map so repeated calls cannot grow s.pkce without bound.
+	for k, p := range s.pkce {
+		if time.Since(p.Created) > 10*time.Minute {
+			delete(s.pkce, k)
+		}
+	}
+	if len(s.pkce) >= 256 {
+		var oldestKey string
+		var oldest time.Time
+		for k, p := range s.pkce {
+			if oldestKey == "" || p.Created.Before(oldest) {
+				oldestKey, oldest = k, p.Created
+			}
+		}
+		delete(s.pkce, oldestKey)
+	}
 	s.pkce[state] = pendingPKCE{Verifier: v, Created: time.Now(), Status: "pending", RedirectURI: redirectURI}
 	s.mu.Unlock()
 	jsonOut(w, map[string]string{
@@ -1204,6 +1248,8 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 		// different accounts (and thus different exit IPs) are used.
 		seen := make(map[string]bool)
 		var firstUnavailable string
+		tokenFailures := 0 // accounts that were healthy+unfull but failed EnsureValid
+		probedHealthy := 0 // accounts that reached the EnsureValid step
 		for i := 0; i < 256; i++ {
 			acc, ok := s.tokens.Next()
 			if !ok {
@@ -1228,11 +1274,19 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 			}
 			// Found a healthy account with capacity
 			result, err := s.tokens.EnsureValid(accountID)
+			probedHealthy++
 			if err == nil {
 				return result, nil
 			}
+			tokenFailures++
 		}
-		// All accounts probed but none had capacity — check if any are at least healthy
+		// All accounts probed but none usable. Distinguish the real reasons
+		// instead of always blaming concurrency (old behavior returned 429
+		// even when every account just had an expired/rotated token, so
+		// clients retried a permanent auth outage forever):
+		//   - cooldown present → 429 with the earliest recovery window
+		//   - every healthy candidate failed token validation → 401
+		//   - otherwise (all full) → 429 concurrency
 		if !s.accountPool.Available(firstUnavailable) && firstUnavailable != "" {
 			until := s.accountPool.EarliestRecovery()
 			retry := int(time.Until(until).Seconds())
@@ -1240,6 +1294,9 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 				retry = 5
 			}
 			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are cooling down; try again later"}
+		}
+		if tokenFailures > 0 && tokenFailures == probedHealthy {
+			return auth.AccountToken{}, &UpstreamHTTPError{Status: 401, RetryAfter: 300, Body: "no account has a valid token; re-authorize accounts"}
 		}
 		return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: 1, Body: "all accounts are at their concurrency limit; try again shortly"}
 	}
@@ -1403,7 +1460,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.SessionKey != "" {
-		if v, ok := s.sessions.get(body.SessionKey); ok {
+		if v, ok := s.sessions.get(sessionScope(r, body.SessionKey)); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
 			body.ConversationID = firstNonEmpty(body.ConversationID, v.ConversationID)
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
@@ -1537,7 +1594,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	res.Text = sanitizePublicAssistantText(res.Text)
 	res.Reasoning = sanitizePublicReasoningText(res.Reasoning)
 	if body.SessionKey != "" {
-		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text})
+		s.sessions.upsert(conversation{ID: sessionScope(r, body.SessionKey), AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text})
 	}
 	if res.Throttling != nil {
 		if b, err := json.Marshal(res.Throttling); err == nil {
@@ -1947,7 +2004,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if body.SessionKey != "" {
-		if v, ok := s.sessions.get(body.SessionKey); ok {
+		if v, ok := s.sessions.get(sessionScope(r, body.SessionKey)); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
 			body.ConversationID = firstNonEmpty(body.ConversationID, v.ConversationID)
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
@@ -2152,8 +2209,13 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		keepaliveDone := make(chan struct{})
-		defer close(keepaliveDone)
+		keepaliveExited := make(chan struct{})
+		defer func() {
+			close(keepaliveDone)
+			<-keepaliveExited // net/http forbids ResponseWriter use after return
+		}()
 		go func() {
+			defer close(keepaliveExited)
 			for {
 				select {
 				case <-keepaliveDone:
@@ -2631,8 +2693,13 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		ticker2 := time.NewTicker(15 * time.Second)
 		defer ticker2.Stop()
 		keepaliveDone2 := make(chan struct{})
-		defer close(keepaliveDone2)
+		keepaliveExited2 := make(chan struct{})
+		defer func() {
+			close(keepaliveDone2)
+			<-keepaliveExited2 // net/http forbids ResponseWriter use after return
+		}()
 		go func() {
+			defer close(keepaliveExited2)
 			for {
 				select {
 				case <-keepaliveDone2:
@@ -2788,12 +2855,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		if err == nil && ct == 0 {
 			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "upstream returned empty completion; the requested model may be unavailable for this tenant", "code": "upstream_error"}})+"\n\n")
 		}
-		// If we streamed content but got an error, use "stop" not "error"
-		// so the client treats the response as complete, not failed.
+		// Errors are signalled to the client via the dedicated error event
+		// emitted above; the stream itself must terminate with the standard
+		// "stop" finish_reason ("error" is not a valid enum value and strict
+		// clients choke on it).
 		finish := "stop"
-		if err != nil && streamedReasoningLen == 0 {
-			finish = "error"
-		}
 		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
 		if res.Throttling != nil {
 			usageChunk["x_m365_throttling"] = res.Throttling
@@ -2846,22 +2912,22 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				}
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				defer cancel2()
-			failoverServingID := next.ID
-			res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, withServingAccount(&failoverServingID))
-			if failoverServingID != next.ID {
-				if newAcc, ok := s.tokens.Get(failoverServingID); ok {
-					next = newAcc
+				failoverServingID := next.ID
+				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, withServingAccount(&failoverServingID))
+				if failoverServingID != next.ID {
+					if newAcc, ok := s.tokens.Get(failoverServingID); ok {
+						next = newAcc
+					}
 				}
-			}
-			if err2 == nil {
-				s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
-				if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
-					s.accountPool.MarkImageLimited(acc.ID)
-				}
-				s.accountPool.MarkSuccess(next.ID)
-				res = res2
-				acc = next
-				err = nil
+				if err2 == nil {
+					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
+					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
+						s.accountPool.MarkImageLimited(acc.ID)
+					}
+					s.accountPool.MarkSuccess(next.ID)
+					res = res2
+					acc = next
+					err = nil
 				} else {
 					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
@@ -2903,7 +2969,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 
 	if body.SessionKey != "" {
-		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
+		s.sessions.upsert(conversation{ID: sessionScope(r, body.SessionKey), AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
 	}
 	if body.User != "" && res.ConversationID != "" {
 		s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
@@ -3029,8 +3095,13 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		ticker3 := time.NewTicker(15 * time.Second)
 		defer ticker3.Stop()
 		keepaliveDone3 := make(chan struct{})
-		defer close(keepaliveDone3)
+		keepaliveExited3 := make(chan struct{})
+		defer func() {
+			close(keepaliveDone3)
+			<-keepaliveExited3 // net/http forbids ResponseWriter use after return
+		}()
 		go func() {
+			defer close(keepaliveExited3)
 			for {
 				select {
 				case <-keepaliveDone3:
@@ -3241,13 +3312,15 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 
 func extractAPIKey(r *http.Request) string {
 	key := strings.TrimSpace(r.Header.Get("X-API-Key"))
-	if key != "" {
-		return key
+	if key == "" {
+		auth := r.Header.Get("Authorization")
+		if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+			key = strings.TrimSpace(auth[7:])
+		}
 	}
-	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-		key = strings.TrimSpace(auth[7:])
-	}
+	// Always return only a short display prefix: this value is persisted into
+	// usage.jsonl and stats.json. Returning the full secret for X-API-Key
+	// callers (the old early-return) wrote complete API keys to disk.
 	if len(key) > 8 {
 		return key[:8] + "..."
 	}

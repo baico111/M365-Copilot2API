@@ -12,7 +12,7 @@ func TestE2EResponsesToolCallID(t *testing.T) {
 	// 模拟 writeToolResponse 输出的 Chat Completions JSON
 	// 这是 openaiChat 通过 httptest.Recorder 返回给 runOpenAIAdapter 的内容
 	chatCompletion := map[string]any{
-		"id": "chatcmpl-test-123",
+		"id":     "chatcmpl-test-123",
 		"object": "chat.completion",
 		"choices": []any{
 			map[string]any{

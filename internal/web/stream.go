@@ -31,7 +31,7 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.SessionKey != "" {
-		if v, ok := s.sessions.get(body.SessionKey); ok {
+		if v, ok := s.sessions.get(sessionScope(r, body.SessionKey)); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
 			body.ConversationID = firstNonEmpty(body.ConversationID, v.ConversationID)
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
@@ -96,7 +96,7 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if body.SessionKey != "" {
-		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text})
+		s.sessions.upsert(conversation{ID: sessionScope(r, body.SessionKey), AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: text})
 	}
 	res.Text = sanitizePublicAssistantText(res.Text)
 	res.Text, _ = chathub.StripCitationMarkers(res.Text, res.References)
@@ -124,8 +124,13 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	keepaliveDone := make(chan struct{})
-	defer close(keepaliveDone)
+	keepaliveExited := make(chan struct{})
+	defer func() {
+		close(keepaliveDone)
+		<-keepaliveExited // net/http forbids ResponseWriter use after return
+	}()
 	go func() {
+		defer close(keepaliveExited)
 		for {
 			select {
 			case <-keepaliveDone:
@@ -146,23 +151,23 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 			"sessionId":      res.SessionID,
 			"requestId":      res.RequestID,
 		}
-		if err := writeSSE(r, w, flusher, "event", payload); err != nil {
+		if err := sw.event("event", payload); err != nil {
 			return
 		}
 	}
 	for i, event := range chathub.SemanticEvents(res.Events) {
-		if err := writeSSE(r, w, flusher, "semantic", map[string]any{"index": i, "type": "m365.semantic", "event": event}); err != nil {
+		if err := sw.event("semantic", map[string]any{"index": i, "type": "m365.semantic", "event": event}); err != nil {
 			return
 		}
 	}
-	if err := writeSSE(r, w, flusher, "done", map[string]any{
+	if err := sw.event("done", map[string]any{
 		"type": "done", "text": res.Text,
 		"conversationId": res.ConversationID, "sessionId": res.SessionID, "requestId": res.RequestID,
 		"throttling": res.Throttling, "suggestedResponses": res.SuggestedResponses,
 		"offense": res.Offense, "scores": res.Scores, "conversationTransferToken": res.ConversationTransferToken,
 		"meteringInformation": res.MeteringInformation, "spokenText": res.SpokenText,
 		"storageMessageId": res.StorageMessageID,
-		"timestamps": res.Timestamps,
+		"timestamps":       res.Timestamps,
 	}); err != nil {
 		return
 	}

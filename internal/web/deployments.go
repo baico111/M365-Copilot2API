@@ -223,7 +223,17 @@ func (s *Server) deploymentCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	st.mu.Unlock()
 	start := time.Now()
-	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(target, "/")+"/health", nil)
+	healthURL := strings.TrimRight(target, "/") + "/health"
+	hu, perr := url.Parse(healthURL)
+	if perr != nil || (hu.Scheme != "http" && hu.Scheme != "https") || hu.Host == "" {
+		writeOpenAIError(w, 400, "invalid_request_error", "deployment target is not a valid http(s) URL")
+		return
+	}
+	req, rerr := http.NewRequestWithContext(r.Context(), http.MethodGet, healthURL, nil)
+	if rerr != nil {
+		writeOpenAIError(w, 400, "invalid_request_error", rerr.Error())
+		return
+	}
 	resp, e := deploymentHTTPClient.Do(req)
 	lat := time.Since(start).Milliseconds()
 	st.mu.Lock()

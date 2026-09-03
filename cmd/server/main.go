@@ -37,14 +37,19 @@ func main() {
 	if v := os.Getenv("M365_LISTEN"); v != "" {
 		listen = v
 	}
-	log.Printf("m365-copilot2api listening on http://%s\\n", listen)
+	log.Printf("m365-copilot2api listening on http://%s\n", listen)
 	server := &http.Server{
 		Addr:              listen,
 		Handler:           s.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		WriteTimeout:      0, // streaming endpoints need an open-ended write window.
+		// ReadTimeout caps the time allowed to read headers AND the request
+		// body as a whole; 30s truncated large chat/image payloads on slow
+		// links (22 MiB multipart edits), and handlers that keep the request
+		// context alive past it. Bound only the header phase; body reads are
+		// bounded by per-handler context deadlines.
+		ReadTimeout:  0,
+		IdleTimeout:  120 * time.Second,
+		WriteTimeout: 0, // streaming endpoints need an open-ended write window; SSE handlers use per-frame SetWriteDeadline.
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

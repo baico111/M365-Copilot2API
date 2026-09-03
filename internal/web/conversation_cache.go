@@ -50,6 +50,10 @@ func (c *conversationCache) Lookup(sessionKey, accountID, model string) *cachedC
 		delete(c.entries, k)
 		return nil
 	}
+	// A hit is a cache-miss-avoided: refresh LastUsedAt so a hot conversation
+	// is not evicted mid-session and not swept by auto_cleanup protection
+	// logic (which reads this same timestamp).
+	entry.LastUsedAt = time.Now()
 	return entry
 }
 
@@ -64,6 +68,37 @@ func (c *conversationCache) Invalidate(sessionKey, accountID, model string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.entries, c.key(sessionKey, accountID, model))
+}
+
+// InvalidateByConversation drops every cache entry that points at the given
+// cloud conversation (used after the conversation is deleted upstream — the
+// key dimension alone cannot find all owners of one ConversationID).
+func (c *conversationCache) InvalidateByConversation(convID string) {
+	if convID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, e := range c.entries {
+		if e != nil && e.ConversationID == convID {
+			delete(c.entries, k)
+		}
+	}
+}
+
+// ActiveConversationIDs returns conversation IDs with a cache hit inside the
+// window so the cleanup sweep can protect still-reusable conversations.
+func (c *conversationCache) ActiveConversationIDs(window time.Duration) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cutoff := time.Now().Add(-window)
+	out := make([]string, 0, len(c.entries))
+	for _, e := range c.entries {
+		if e != nil && e.ConversationID != "" && e.LastUsedAt.After(cutoff) {
+			out = append(out, e.ConversationID)
+		}
+	}
+	return out
 }
 
 func (c *conversationCache) GC() {

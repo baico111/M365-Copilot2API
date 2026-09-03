@@ -121,9 +121,9 @@ func (s *Server) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 	}
 	stats := cacheStats.GetStats()
 	jsonOut(w, map[string]any{
-		"object":       "cache_stats",
-		"stats":        stats,
-		"conv_cache":   s.convCache.Stats(),
+		"object":     "cache_stats",
+		"stats":      stats,
+		"conv_cache": s.convCache.Stats(),
 	})
 }
 
@@ -312,12 +312,20 @@ func (s *Server) handleM365Cleanup(w http.ResponseWriter, r *http.Request) {
 		keepN = 5
 	}
 
-	deleted, err := m365CloudClient.CleanupOldConversations(maxAge, keepN)
+	deletedIDs, err := m365CloudClient.CleanupOldConversations(maxAge, keepN)
+	if len(deletedIDs) > 0 {
+		// Every binding that still points at a deleted conversation must be
+		// dropped here; the next request would otherwise resume a dead
+		// cloud conversation and get 502/empty responses until TTL expiry.
+		for _, id := range deletedIDs {
+			s.dropConversation(id)
+		}
+	}
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "m365_error", err.Error())
 		return
 	}
-	jsonOut(w, map[string]any{"status": "cleaned", "deleted": deleted})
+	jsonOut(w, map[string]any{"status": "cleaned", "deleted": len(deletedIDs)})
 }
 
 func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {

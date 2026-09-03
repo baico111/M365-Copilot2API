@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -116,7 +117,9 @@ func ROPC(username, password string) (TokenSet, error) {
 }
 
 func requestTokenTenant(form url.Values, endpoint string, caller string, oid, tid string) (TokenSet, error) {
-	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return TokenSet{}, err
 	}
@@ -138,7 +141,20 @@ func requestTokenTenant(form url.Values, endpoint string, caller string, oid, ti
 		return TokenSet{}, fmt.Errorf("decode token response: %w", err)
 	}
 	if tr.Error != "" {
-		return TokenSet{}, fmt.Errorf("%s %s: %s", caller, tr.Error, tr.ErrorDesc)
+		return TokenSet{}, &OAuthError{
+			Code:          tr.Error,
+			AADSTS:        aadstsCode(tr.ErrorDesc),
+			HTTPStatus:    resp.StatusCode,
+			CorrelationID: firstNonEmpty(tr.CorrelationID, resp.Header.Get("client-request-id")),
+			TraceID:       firstNonEmpty(tr.TraceID, resp.Header.Get("x-ms-request-id")),
+		}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		snippet := strings.TrimSpace(string(body))
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		return TokenSet{}, fmt.Errorf("%s HTTP %d: %s", caller, resp.StatusCode, snippet)
 	}
 	if tr.AccessToken == "" {
 		return TokenSet{}, fmt.Errorf("%s HTTP %d: empty access token", caller, resp.StatusCode)
@@ -173,7 +189,9 @@ func requestTokenTenant(form url.Values, endpoint string, caller string, oid, ti
 }
 
 func requestToken(form url.Values) (TokenSet, error) {
-	req, err := http.NewRequest(http.MethodPost, TokenEndpoint(), strings.NewReader(form.Encode()))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, TokenEndpoint(), strings.NewReader(form.Encode()))
 	if err != nil {
 		return TokenSet{}, err
 	}

@@ -1,10 +1,12 @@
 package chathub
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // validateRemoteDownloadURL blocks SSRF: only https and public routable
@@ -50,4 +52,49 @@ func ipUnsafe(ip net.IP) bool {
 		return true
 	}
 	return false
+}
+
+// validatedDialContext fixes the DNS-rebinding (TOCTOU) hole in
+// validateRemoteDownloadURL: validating the resolved IPs and then calling a
+// plain http.Get re-resolves the hostname, letting a short-TTL record flip
+// from a public IP to 127.0.0.1/169.254.169.254 between check and connect.
+// This dialer re-resolves at connect time, drops every unsafe address, and
+// dials the validated IP directly (TLS SNI/verification still uses the real
+// hostname because http.Transport derives it from the request URL).
+func validatedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	// Literal IPs skip resolution.
+	ips := []net.IP{}
+	if ip := net.ParseIP(host); ip != nil {
+		ips = append(ips, ip)
+	} else {
+		resolved, rerr := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if rerr != nil || len(resolved) == 0 {
+			return nil, fmt.Errorf("attachment host does not resolve")
+		}
+		for _, ra := range resolved {
+			ips = append(ips, ra.IP)
+		}
+	}
+	var lastErr error
+	for _, ip := range ips {
+		if ipUnsafe(ip) {
+			lastErr = fmt.Errorf("attachment URL targets a non-public address")
+			continue
+		}
+		d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		conn, derr := d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if derr != nil {
+			lastErr = derr
+			continue
+		}
+		return conn, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no safe address for attachment host")
+	}
+	return nil, lastErr
 }

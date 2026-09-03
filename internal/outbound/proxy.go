@@ -28,7 +28,24 @@ var (
 	clientsMu sync.RWMutex
 	clients   = directClients()
 	proxyPool *Pool
+	// singleProxyConfigured marks Configure(raw) with a non-empty proxy,
+	// replacing the direct transport with one whose DialContext routes via
+	// that proxy. It must be distinguishable from the untouched direct
+	// transport (both can have a nil Proxy field).
+	singleProxyConfigured bool
 )
+
+// EgressIsDirect reports whether outbound traffic leaves this process
+// directly (no pool, no single proxy, no sing-box). Attachment-download code uses
+// it to enable IP-pinned validated dialing only where such validation is
+// meaningful; behind a proxy the DNS resolution happens at the remote exit
+// and a local check could not bind the same address it resolved.
+func EgressIsDirect() bool {
+	clientsMu.RLock()
+	direct := !singleProxyConfigured && proxyPool == nil
+	clientsMu.RUnlock()
+	return direct && !SingBoxRunning()
+}
 
 func directClients() *Clients {
 	tlsCache := tls.NewLRUClientSessionCache(32)
@@ -47,11 +64,11 @@ func directClients() *Clients {
 	return &Clients{
 		HTTP: &http.Client{Transport: t},
 		WebSocket: &websocket.Dialer{
-			HandshakeTimeout:  20 * time.Second,
-			ReadBufferSize:    256 * 1024,
-			WriteBufferSize:   16 * 1024,
-			NetDialContext:    t.DialContext,
-			TLSClientConfig:   wsTLSConf,
+			HandshakeTimeout: 20 * time.Second,
+			ReadBufferSize:   256 * 1024,
+			WriteBufferSize:  16 * 1024,
+			NetDialContext:   t.DialContext,
+			TLSClientConfig:  wsTLSConf,
 		},
 	}
 }
@@ -76,6 +93,7 @@ func Configure(raw string) error {
 	}
 	clientsMu.Lock()
 	clients = c
+	singleProxyConfigured = raw != ""
 	proxyPool = nil
 	clientsMu.Unlock()
 	return nil
@@ -234,8 +252,8 @@ type httpsProxyDialer struct{ proxyURL *url.URL }
 // a single slow proxy node does not consume the entire request budget through
 // one hanging phase while other phases would have succeeded.
 const (
-	httpsProxyTCPTimeout   = 10 * time.Second
-	httpsProxyTLSTimeout   = 10 * time.Second
+	httpsProxyTCPTimeout     = 10 * time.Second
+	httpsProxyTLSTimeout     = 10 * time.Second
 	httpsProxyCONNECTTimeout = 8 * time.Second
 )
 
@@ -246,13 +264,17 @@ func minDeadline(ctx context.Context, d time.Duration) (context.Context, context
 	if dl, ok := ctx.Deadline(); ok {
 		remaining := time.Until(dl)
 		if remaining <= 0 {
-			return context.WithTimeout(context.Background(), 1*time.Millisecond) // already expired
+			return context.WithTimeout(ctx, 1*time.Millisecond) // already expired
 		}
 		if remaining < d {
 			d = remaining
 		}
 	}
-	return context.WithTimeout(context.Background(), d)
+	// Derive from ctx (NOT context.Background): a Background base silently
+	// dropped parent cancellation, so a disconnected client left the
+	// proxy TCP/TLS/CONNECT phases running to full timeout holding sockets
+	// and re-dialing an unreachable proxy after nobody was listening.
+	return context.WithTimeout(ctx, d)
 }
 
 func (d httpsProxyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {

@@ -20,7 +20,7 @@ func (s *Server) proxyPool(w http.ResponseWriter, r *http.Request) {
 		// Reconfigure sing-box with a new subscription URL
 		var body struct {
 			Subscription string `json:"subscription"`
-			URL          string  `json:"url"`
+			URL          string `json:"url"`
 		}
 		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body) != nil {
 			writeOpenAIError(w, 400, "invalid_request_error", "bad json")

@@ -21,6 +21,21 @@ func declaredShell(allowed map[string]bool) string {
 	return ""
 }
 
+// shellCallArgs builds {command,timeout?,workdir?} without emitting explicit
+// nulls for optional fields that are absent: a schema-typed timeout/workdir
+// rejects null, so injecting them unconditionally used to make every valid
+// fenced bash call fail schema validation (dropped call or repair round).
+func shellCallArgs(m map[string]any) map[string]any {
+	args := map[string]any{"command": m["command"]}
+	if v, ok := m["timeout"]; ok && v != nil {
+		args["timeout"] = v
+	}
+	if v, ok := m["workdir"]; ok && v != nil {
+		args["workdir"] = v
+	}
+	return args
+}
+
 func fencedToolCalls(text string, tools []map[string]any, choice any) []detectedToolCall {
 	allowed := allowedToolNames(tools)
 	shell := declaredShell(allowed)
@@ -42,7 +57,7 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 			}
 			if m, ok := v.(map[string]any); ok {
 				if cmd, hasCmd := m["command"]; hasCmd && cmd != "" {
-					cmdBytes, _ := json.Marshal(map[string]any{"command": cmd, "timeout": m["timeout"], "workdir": m["workdir"]})
+					cmdBytes, _ := json.Marshal(shellCallArgs(map[string]any{"command": cmd, "timeout": m["timeout"], "workdir": m["workdir"]}))
 					out = append(out, detectedToolCall{ID: callID(converted, string(cmdBytes), len(out)), Type: "function", Name: converted, Arguments: cmdBytes})
 					continue
 				}
@@ -86,7 +101,7 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 				continue
 			}
 			if cmd, hasCmd := obj["command"]; hasCmd && cmd != "" {
-				cmdBytes, _ := json.Marshal(map[string]any{"command": cmd, "timeout": obj["timeout"], "workdir": obj["workdir"]})
+				cmdBytes, _ := json.Marshal(shellCallArgs(map[string]any{"command": cmd, "timeout": obj["timeout"], "workdir": obj["workdir"]}))
 				out = append(out, detectedToolCall{ID: callID(shell, string(cmdBytes), len(out)), Type: "function", Name: shell, Arguments: cmdBytes})
 				break
 			}

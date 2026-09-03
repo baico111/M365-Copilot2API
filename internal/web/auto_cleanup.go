@@ -58,7 +58,6 @@ func (s *Server) autoCleanupOnce(maxAge time.Duration, keepN int) {
 		return
 	}
 	now := time.Now()
-	active := s.activeConversationSet(maxAge)
 
 	type cand struct {
 		id       string
@@ -66,6 +65,10 @@ func (s *Server) autoCleanupOnce(maxAge time.Duration, keepN int) {
 	}
 	deleted := 0
 	for round := 0; round < 100; round++ {
+		// Recompute every round: a multi-round sweep can span minutes, and a
+		// conversation that becomes active after the first snapshot must not
+		// be deleted while still in use (stale-snapshot TOCTOU → 502 storms).
+		active := s.activeConversationSet(maxAge)
 		chats, err := m365CloudClient.ListConversations()
 		if err != nil {
 			log.Printf("[auto-cleanup] list failed: %v", err)
@@ -142,6 +145,20 @@ func (s *Server) activeConversationSet(window time.Duration) map[string]bool {
 	for convID := range s.userSessions.ActiveConversations(window) {
 		active[convID] = true
 	}
+	// convCache and the legacy session store also route requests straight by
+	// ConversationID; a conversation kept alive there must not be swept.
+	if s.convCache != nil {
+		for _, convID := range s.convCache.ActiveConversationIDs(window) {
+			active[convID] = true
+		}
+	}
+	if s.sessions != nil {
+		for _, c := range s.sessions.list() {
+			if window <= 0 || time.Since(c.UpdatedAt) <= window {
+				active[c.ConversationID] = true
+			}
+		}
+	}
 	for _, id := range s.conversationManager.WhitelistedIDs() {
 		active[id] = true
 	}
@@ -154,8 +171,20 @@ func (s *Server) activeConversationSet(window time.Duration) map[string]bool {
 }
 
 // dropConversation 删除云端对话后联动清理本地索引与防串号绑定，
-// 防止后续请求复用已死的对话造成串号或幽灵会话。
+// 防止后续请求复用已死的对话造成串号或幽灵会话。所有以
+// ConversationID 为路由依据的存储（convCache、userSessions、legacy
+// sessions）都必须一起失效，否则请求会继续发往已删除的云端对话，
+// 表现为成片 502/空回复且永不自愈。
 func (s *Server) dropConversation(convID string) {
 	s.conversationManager.Delete(convID)
 	s.sessionResolver.UnbindByConversation(convID)
+	if s.convCache != nil {
+		s.convCache.InvalidateByConversation(convID)
+	}
+	if s.userSessions != nil {
+		s.userSessions.RemoveByConversation(convID)
+	}
+	if s.sessions != nil {
+		s.sessions.removeByConversation(convID)
+	}
 }

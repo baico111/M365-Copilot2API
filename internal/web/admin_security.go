@@ -291,11 +291,17 @@ func auditLog(r *http.Request, event, detail string) {
 
 func clientIP(r *http.Request) string {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if net.ParseIP(host).IsLoopback() {
-		parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
-		for i := len(parts) - 1; i >= 0; i-- {
-			if ip := net.ParseIP(strings.TrimSpace(parts[i])); ip != nil {
-				return ip.String()
+	// XFF is attacker-supplied unless a reverse proxy is proven to be in
+	// front of us. Auto-trusting any loopback peer lets a direct client
+	// rotate the header to defeat per-IP login lockout and forge audit IPs.
+	// Require an explicit deployment opt-in before consulting XFF.
+	if os.Getenv("M365_TRUST_PROXY") == "1" && host != "" {
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+			for i := len(parts) - 1; i >= 0; i-- {
+				if tip := net.ParseIP(strings.TrimSpace(parts[i])); tip != nil {
+					return tip.String()
+				}
 			}
 		}
 	}

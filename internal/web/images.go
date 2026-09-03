@@ -498,17 +498,53 @@ func downloadImageAsBase64(url string) (b64, contentType string, err error) {
 	return downloadImageAsBase64WithToken(url, "")
 }
 
-func downloadImageAsBase64WithToken(url, token string) (b64, contentType string, err error) {
+// isMicrosoftTrustedImageHost gates which hosts may ever receive the account
+// bearer token. The download URL ultimately comes from upstream model output
+// (res.Images extracted from Chathub frames), so without this list a crafted
+// answer could make the server fetch attacker.com WITH a live Microsoft token.
+func isMicrosoftTrustedImageHost(host string) bool {
+	h := strings.ToLower(host)
+	for _, suffix := range []string{
+		".microsoft.com", ".microsoftusercontent.com", ".office.com",
+		".officeapps.live.com", ".live.com", ".bing.com", ".bing.net",
+	} {
+		if strings.HasSuffix(h, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func downloadImageAsBase64WithToken(rawURL, token string) (b64, contentType string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", "", err
 	}
-	if token != "" {
+	initialHost := req.URL.Hostname()
+	if token != "" && isMicrosoftTrustedImageHost(req.URL.Hostname()) {
 		req.Header.Set("Authorization", "Bearer "+token)
+	} else if token != "" {
+		// Token withheld from an untrusted host: try an anonymous fetch so
+		// public images still work without ever leaking credentials.
+		log.Printf("[images] withheld bearer token from untrusted image host %s", initialHost)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(r *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("too many redirects")
+			}
+			// Never let a redirect escape to a host we would not have sent
+			// the token to in the first place.
+			if !isMicrosoftTrustedImageHost(r.URL.Hostname()) {
+				r.Header.Del("Authorization")
+			}
+			return nil
+		},
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", "", err
 	}

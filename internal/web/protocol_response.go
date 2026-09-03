@@ -218,3 +218,16 @@ func (s *sseWriter) raw(payload string) error {
 func (s *sseWriter) data(data string) error {
 	return s.raw("data: " + data + "\n\n")
 }
+
+// event serializes a named SSE event (event: <name>\ndata: <json>\n\n)
+// through the same mutex that guards keepalive writes. Any handler that
+// pairs an sseWriter keepalive with named events MUST emit through this
+// method — writing via plain Fprintf on the shared ResponseWriter would
+// interleave with keepalive frames and corrupt the stream.
+func (s *sseWriter) event(name string, value any) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return s.raw("event: " + name + "\ndata: " + string(b) + "\n\n")
+}

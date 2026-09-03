@@ -198,38 +198,38 @@ type Account struct {
 }
 
 type Request struct {
-	Text           string
-	Tone           string
-	ConversationID string
-	SessionID      string
-	Attachments    []Attachment
-	Tools          []Tool
-	ToolChoice     any
-	MCPServerURL   string
-	Started        bool
-	ConversationSignature   string
-	PreviousMessages        []ContextMessage
-	LicenseType             string
-	Scenario                string
-	ConnectedFederatedIDs   []string
-	FeatureFlags            FeatureFlags
-	DisableMemory           bool
-	Locale                  string
-	Market                  string
-	TimeZone                string
-	TimeZoneOffset          int
-	DeviceOS                string
+	Text                  string
+	Tone                  string
+	ConversationID        string
+	SessionID             string
+	Attachments           []Attachment
+	Tools                 []Tool
+	ToolChoice            any
+	MCPServerURL          string
+	Started               bool
+	ConversationSignature string
+	PreviousMessages      []ContextMessage
+	LicenseType           string
+	Scenario              string
+	ConnectedFederatedIDs []string
+	FeatureFlags          FeatureFlags
+	DisableMemory         bool
+	Locale                string
+	Market                string
+	TimeZone              string
+	TimeZoneOffset        int
+	DeviceOS              string
 }
 
 type FeatureFlags struct {
-	MemoryV2            bool
-	DeepWork            bool
-	ComputerUse         bool
-	RealtimeVoice       bool
+	MemoryV2             bool
+	DeepWork             bool
+	ComputerUse          bool
+	RealtimeVoice        bool
 	SystemPromptOverride bool
-	DesignerImageGen4o  bool
-	CodeCanvas          bool
-	SydneyReconnect     bool
+	DesignerImageGen4o   bool
+	CodeCanvas           bool
+	SydneyReconnect      bool
 }
 
 type ContextMessage struct {
@@ -255,10 +255,10 @@ type StreamEvent struct {
 type StreamHandler func(StreamEvent) error
 
 type Timestamps struct {
-	RequestSent                string `json:"requestSent"`
+	RequestSent                  string `json:"requestSent"`
 	FirstServiceResponseReceived string `json:"firstServiceResponseReceived,omitempty"`
-	FirstTokenReceived         string `json:"firstTokenReceived,omitempty"`
-	LastTokenReceived          string `json:"lastTokenReceived,omitempty"`
+	FirstTokenReceived           string `json:"firstTokenReceived,omitempty"`
+	LastTokenReceived            string `json:"lastTokenReceived,omitempty"`
 }
 
 type Result struct {
@@ -500,6 +500,13 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 			connWriteMu.Lock()
 			defer connWriteMu.Unlock()
 		}
+		// Refresh the write deadline on every write. SetWriteDeadline is an
+		// absolute timestamp, so the single 15s cap set before the handshake
+		// would otherwise expire mid-exchange: after ~15s every subsequent
+		// write (including SignalR ping responses) fails silently, the gateway
+		// stops answering pings, and the upstream drops the connection —
+		// truncating the response or surfacing as a 502.
+		_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		return conn.WriteMessage(msgType, data)
 	}
 
@@ -695,6 +702,27 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 	readCh := make(chan wsRead, 8)
 	done := make(chan struct{})
 	defer close(done)
+	// partialResult builds a Result from whatever streamed so far. Carrying
+	// ConversationID/SessionID/RequestID is essential: without them the web
+	// layer cannot bind the (still-live) cloud conversation, so a client that
+	// sends a follow-up "继续" would start a brand-new conversation and the
+	// cut-off answer could never be resumed.
+	partialResult := func(txt string) Result {
+		return Result{
+			Text:               txt,
+			Reasoning:          reasoningBuf.String(),
+			ConversationID:     req.ConversationID,
+			SessionID:          req.SessionID,
+			RequestID:          requestID,
+			Throttling:         throttling,
+			SuggestedResponses: suggestions,
+			References:         references,
+			RawResult:          rawResult,
+			Events:             events,
+			Normalized:         NormalizeEvents(events),
+			Timestamps:         ts,
+		}
+	}
 	go func() {
 		defer close(readCh)
 		for {
@@ -781,7 +809,7 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 			if streamedText != "" {
 				log.Printf("[chathub] ctx deadline exceeded, returning partial result (%d bytes)", len(streamedText))
 				returnConn = false
-				return Result{Text: streamedText, Reasoning: reasoningBuf.String(), Events: events, Normalized: NormalizeEvents(events), Timestamps: ts}, nil
+				return partialResult(streamedText), nil
 			}
 			return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", cause: ctx.Err()}
 		case r, ok := <-readCh:
@@ -801,7 +829,7 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 					if streamedText != "" {
 						log.Printf("[chathub] readCh closed, returning partial result (%d bytes)", len(streamedText))
 						returnConn = false
-						return Result{Text: streamedText, Reasoning: reasoningBuf.String(), Events: events, Normalized: NormalizeEvents(events), Timestamps: ts}, nil
+						return partialResult(streamedText), nil
 					}
 					return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", cause: ctx.Err()}
 				}
@@ -837,7 +865,7 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 				}
 				log.Printf("[chathub] ws read error, returning partial result (%d bytes): kind=%s", len(streamedText), kind)
 				returnConn = false
-				return Result{Text: streamedText, Reasoning: reasoningBuf.String(), Events: events, Normalized: NormalizeEvents(events), Timestamps: ts}, nil
+				return partialResult(streamedText), nil
 			}
 			kind := "WS_READ_TIMEOUT"
 			if isTimeout {
@@ -1097,25 +1125,25 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 						}
 					}
 					if res, ok := item["result"].(map[string]any); ok {
-					rawResult, _ = res["value"].(string)
-					if mi, ok := res["meteringInformation"]; ok && mi != nil {
-						meteringInformation = mi
-					}
-					if msg, ok := res["message"].(string); ok {
-						final = msg
-						if imageLimitDetected(final) {
-							returnConn = false
-							return Result{}, ErrImageLimit
+						rawResult, _ = res["value"].(string)
+						if mi, ok := res["meteringInformation"]; ok && mi != nil {
+							meteringInformation = mi
 						}
-						if rateLimited(final) {
-							returnConn = false
-							return Result{}, ErrRateLimitNotice
+						if msg, ok := res["message"].(string); ok {
+							final = msg
+							if imageLimitDetected(final) {
+								returnConn = false
+								return Result{}, ErrImageLimit
+							}
+							if rateLimited(final) {
+								returnConn = false
+								return Result{}, ErrRateLimitNotice
+							}
+							if IsContentPolicyBlock(final) {
+								returnConn = false
+								return Result{}, ErrOffensiveContent
+							}
 						}
-						if IsContentPolicyBlock(final) {
-							returnConn = false
-							return Result{}, ErrOffensiveContent
-						}
-					}
 					}
 				}
 				// completion frame often follows; keep reading a bit but we already have content
@@ -1215,13 +1243,7 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 		if errors.Is(ctx.Err(), context.Canceled) {
 			log.Printf("[chathub] client canceled with %d bytes streamed; returning partial result (depth=%d)", len(streamedText), depth)
 			returnConn = false
-			return Result{
-				Text:       streamedText,
-				Reasoning:  reasoningBuf.String(),
-				Events:     events,
-				Normalized: NormalizeEvents(events),
-				Timestamps: ts,
-			}, nil
+			return partialResult(streamedText), nil
 		}
 		log.Printf("[chathub] deadline exceeded with %d bytes streamed; attempting auto-continue (depth=%d)", len(streamedText), depth)
 		returnConn = false
@@ -1260,25 +1282,25 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 			// Combine: original streamed text + continuation text.
 			combined := streamedText + continueResult.Text
 			return Result{
-				Text:                       combined,
-				Reasoning:                  reasoningBuf.String() + continueResult.Reasoning,
-				ConversationID:             continueResult.ConversationID,
-				SessionID:                  continueResult.SessionID,
-				RequestID:                  continueResult.RequestID,
-				Throttling:                 continueResult.Throttling,
-				SuggestedResponses:         continueResult.SuggestedResponses,
-				Offense:                    continueResult.Offense,
-				Scores:                     continueResult.Scores,
-				ConversationTransferToken:  continueResult.ConversationTransferToken,
-				MeteringInformation:        continueResult.MeteringInformation,
-				SpokenText:                 continueResult.SpokenText,
-				StorageMessageID:           continueResult.StorageMessageID,
-				References:                 references,
-				RawResult:                  continueResult.RawResult,
-				Events:                     append(events, continueResult.Events...),
-				Normalized:                 NormalizeEvents(append(events, continueResult.Events...)),
-				Images:                     continueResult.Images,
-				Timestamps:                 ts,
+				Text:                      combined,
+				Reasoning:                 reasoningBuf.String() + continueResult.Reasoning,
+				ConversationID:            continueResult.ConversationID,
+				SessionID:                 continueResult.SessionID,
+				RequestID:                 continueResult.RequestID,
+				Throttling:                continueResult.Throttling,
+				SuggestedResponses:        continueResult.SuggestedResponses,
+				Offense:                   continueResult.Offense,
+				Scores:                    continueResult.Scores,
+				ConversationTransferToken: continueResult.ConversationTransferToken,
+				MeteringInformation:       continueResult.MeteringInformation,
+				SpokenText:                continueResult.SpokenText,
+				StorageMessageID:          continueResult.StorageMessageID,
+				References:                references,
+				RawResult:                 continueResult.RawResult,
+				Events:                    append(events, continueResult.Events...),
+				Normalized:                NormalizeEvents(append(events, continueResult.Events...)),
+				Images:                    continueResult.Images,
+				Timestamps:                ts,
 			}, nil
 		}
 		// Continue failed — return what we have as partial result.
@@ -1287,24 +1309,12 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 		} else {
 			log.Printf("[chathub] auto-continue returned empty (depth=%d); returning partial result (%d bytes)", depth, len(streamedText))
 		}
-		return Result{
-			Text:       streamedText,
-			Reasoning:  reasoningBuf.String(),
-			Events:     events,
-			Normalized: NormalizeEvents(events),
-			Timestamps: ts,
-		}, nil
+		return partialResult(streamedText), nil
 	}
 	if streamedText != "" && depth >= maxAutoContinue {
 		log.Printf("[chathub] max auto-continue depth reached (%d); returning partial result (%d bytes)", depth, len(streamedText))
 		returnConn = false
-		return Result{
-			Text:       streamedText,
-			Reasoning:  reasoningBuf.String(),
-			Events:     events,
-			Normalized: NormalizeEvents(events),
-			Timestamps: ts,
-		}, nil
+		return partialResult(streamedText), nil
 	}
 	returnConn = false
 	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
@@ -1392,8 +1402,19 @@ func (c *Client) downloadClient() *http.Client {
 	if base == nil {
 		base = http.DefaultClient
 	}
+	transport := base.Transport
+	if outbound.EgressIsDirect() {
+		// Direct egress: pin every dial to an IP that passed the SSRF check
+		// at connect time (defeats DNS rebinding). Proxied egress keeps the
+		// shared transport — resolution happens at the exit node.
+		if t, ok := transport.(*http.Transport); ok {
+			dt := t.Clone()
+			dt.DialContext = validatedDialContext
+			transport = dt
+		}
+	}
 	return &http.Client{
-		Transport: base.Transport,
+		Transport: transport,
 		Timeout:   base.Timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
@@ -1406,6 +1427,8 @@ func (c *Client) downloadClient() *http.Client {
 
 func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversationID string, attachments []Attachment) error {
 	imageCount := 0
+	uploaded, failures := 0, 0
+	var lastErr error
 	for i := range attachments {
 		a := &attachments[i]
 		if a.Type != "image" {
@@ -1492,17 +1515,23 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 		}
 		resp, err := c.HTTPClient.Do(req)
 		if err != nil {
+			lastErr = fmt.Errorf("attachment %d upload http: %w", i, err)
 			log.Printf("[upload] http error: %v", err)
+			failures++
 			continue
 		}
 		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 		resp.Body.Close()
 		if readErr != nil {
+			lastErr = fmt.Errorf("attachment %d upload read: %w", i, readErr)
 			log.Printf("[upload] read error: %v", readErr)
+			failures++
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("attachment %d upload: HTTP %s", i, resp.Status)
 			log.Printf("[upload] status %s: %s", resp.Status, strings.TrimSpace(string(data[:minInt(len(data), 500)])))
+			failures++
 			continue
 		}
 		var out struct {
@@ -1514,13 +1543,18 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 			} `json:"result"`
 		}
 		if err := json.Unmarshal(data, &out); err != nil {
+			lastErr = fmt.Errorf("attachment %d upload response: %w", i, err)
 			log.Printf("[upload] json error: %v", err)
+			failures++
 			continue
 		}
 		if out.Result.Value != "Success" || out.DocID == "" {
+			lastErr = fmt.Errorf("attachment %d upload rejected: %s", i, strings.TrimSpace(string(data[:minInt(len(data), 300)])))
 			log.Printf("[upload] failed: %s", strings.TrimSpace(string(data)))
+			failures++
 			continue
 		}
+		uploaded++
 		a.DocID = out.DocID
 		a.FileType = strings.TrimPrefix(strings.ToLower(out.FileType), ".")
 		// ChatHub's ImageFile annotation uses jpg for JPEG uploads.
@@ -1533,6 +1567,16 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 		if c.Trace != nil {
 			c.Trace(map[string]any{"stage": "upload_success", "doc_id": a.DocID, "file_name": a.Name, "file_type": a.FileType})
 		}
+	}
+	// Previously every per-attachment failure was logged and skipped, so an
+	// upload error silently degraded to "model answered without the image".
+	// If *no* image could be uploaded, fail the request instead — the
+	// messageAnnotations path cannot attach anything and the user must know.
+	if failures > 0 && uploaded == 0 {
+		if lastErr != nil {
+			return lastErr
+		}
+		return fmt.Errorf("all %d image uploads failed", failures)
 	}
 	return nil
 }
@@ -1584,13 +1628,13 @@ func chatPayload(req Request, requestID string, firstTurn bool) string {
 			"timeZoneOffset": tzOffset,
 			"timeZone":       tz,
 		},
-		"locale":         locale,
-		"messageType":    "Chat",
-		"experienceType": "Default",
-		"adaptiveCards":  []any{},
-		"clientPreferences": map[string]any{},
+		"locale":                        locale,
+		"messageType":                   "Chat",
+		"experienceType":                "Default",
+		"adaptiveCards":                 []any{},
+		"clientPreferences":             map[string]any{},
 		"connectedFederatedConnections": fcAny,
-		"clientInfo": clientInfo,
+		"clientInfo":                    clientInfo,
 	}
 	// The browser does not send an OpenAI attachments array to ChatHub. It
 	// sends a file annotation after the file has been uploaded by Office.

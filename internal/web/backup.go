@@ -51,7 +51,7 @@ func (s *Server) accountRestore(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(16 << 20); err != nil {
 		// Fallback: try JSON body with embedded data
 		var body struct {
-			Password string `json:"password"`
+			Password string          `json:"password"`
 			Data     json.RawMessage `json:"data"`
 		}
 		if jsonErr := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<20)).Decode(&body); jsonErr != nil {

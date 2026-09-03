@@ -200,7 +200,13 @@ func (c *M365CloudClient) ListConversations() ([]map[string]any, error) {
 
 	historyList, ok := store["conversationPageHistoryList"].(map[string]any)
 	if !ok {
-		log.Printf("[m365-cloud] conversationPageHistoryList missing from store, returning empty list. store keys: %v", func() []string { keys := make([]string, 0); for k := range store { keys = append(keys, k) }; return keys }())
+		log.Printf("[m365-cloud] conversationPageHistoryList missing from store, returning empty list. store keys: %v", func() []string {
+			keys := make([]string, 0)
+			for k := range store {
+				keys = append(keys, k)
+			}
+			return keys
+		}())
 		return []map[string]any{}, nil
 	}
 
@@ -230,16 +236,19 @@ func (c *M365CloudClient) ListConversations() ([]map[string]any, error) {
 	return chats, nil
 }
 
-func (c *M365CloudClient) CleanupOldConversations(maxAge time.Duration, keepN int) (int, error) {
+func (c *M365CloudClient) CleanupOldConversations(maxAge time.Duration, keepN int) ([]string, error) {
 	// 微软历史列表是"滑动式"的：RefreshNavPane 一次只返回一屏对话，
 	// 删除后进行到的对话会顶上来成为新一批。因此循环拉取删除，直到列表清空。
+	// Returns every deleted conversationId so the caller can invalidate the
+	// local bindings that still point at them.
 	now := time.Now().UnixMilli()
 	deleted := 0
 	kept := 0
+	var deletedIDs []string
 	for round := 0; round < 100; round++ {
 		chats, err := c.ListConversations()
 		if err != nil {
-			return deleted, err
+			return deletedIDs, err
 		}
 		if len(chats) == 0 {
 			break
@@ -262,6 +271,7 @@ func (c *M365CloudClient) CleanupOldConversations(maxAge time.Duration, keepN in
 					continue
 				}
 				deleted++
+				deletedIDs = append(deletedIDs, convID)
 				anyDeleted = true
 			} else {
 				if kept >= keepN {
@@ -270,6 +280,7 @@ func (c *M365CloudClient) CleanupOldConversations(maxAge time.Duration, keepN in
 						continue
 					}
 					deleted++
+					deletedIDs = append(deletedIDs, convID)
 					anyDeleted = true
 				} else {
 					kept++
@@ -283,18 +294,13 @@ func (c *M365CloudClient) CleanupOldConversations(maxAge time.Duration, keepN in
 	}
 
 	log.Printf("[m365-cloud] cleanup: deleted %d, kept %d", deleted, kept)
-	return deleted, nil
+	return deletedIDs, nil
 }
 
-type stringReader string
-
-func (s stringReader) Read(p []byte) (int, error) {
-	n := copy(p, s)
-	if n >= len(s) {
-		return n, io.EOF
-	}
-	return n, nil
-}
+// stringReader was a hand-rolled io.Reader that re-copied from the start on
+// every Read call; payloads larger than io.Copy's 32KB buffer would resend
+// their first chunk forever and corrupt the request body. Use strings.Reader.
+func stringReader(s string) io.Reader { return strings.NewReader(s) }
 
 var m365CloudClient *M365CloudClient
 

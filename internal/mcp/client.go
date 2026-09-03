@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -31,12 +32,21 @@ type Client struct {
 
 // NewClient creates a new MCP client that connects to the given server URL.
 func NewClient(serverURL string) *Client {
+	// The JSON-RPC POST client keeps a 30s ceiling. The SSE GET must NOT use
+	// it: http.Client.Timeout covers the whole response-body lifetime and
+	// killed every MCP session exactly 30s after connect (the "silent stream
+	// drop" symptom), so the SSE path uses its own transport with a header
+	// timeout plus caller-supplied context cancellation.
 	return &Client{
 		serverURL:  serverURL,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		pending:    map[int64]chan json.RawMessage{},
 		done:       make(chan struct{}),
 	}
+}
+
+func (c *Client) sseHTTPClient() *http.Client {
+	return &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: 15 * time.Second}}
 }
 
 func (c *Client) isConnected() bool {
@@ -65,21 +75,32 @@ func (c *Client) Connect(ctx context.Context) error {
 		sseURL = strings.TrimRight(sseURL, "/") + "/sse"
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sseURL, nil)
+	// Create the cancellation context BEFORE the request so Close() can
+	// actually abort the in-flight stream, and use a transport without the
+	// 30s whole-response client timeout: that timeout killed every SSE
+	// session 30s after connect (silent EOF → scanner loop exits →
+	// setConnected(false) with no log), which clients saw as mysterious
+	// mid-task tool failures.
+	sseCtx, cancel := context.WithCancel(ctx)
+	req, err := http.NewRequestWithContext(sseCtx, http.MethodGet, sseURL, nil)
 	if err != nil {
+		cancel()
 		return fmt.Errorf("sse request: %w", err)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.sseHTTPClient().Do(req)
 	if err != nil {
+		cancel()
 		return fmt.Errorf("sse connect: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
+		cancel()
 		return fmt.Errorf("sse status: %s", resp.Status)
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 8<<20)
 	var sessionID string
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -101,10 +122,9 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	if sessionID == "" {
 		resp.Body.Close()
+		cancel()
 		return fmt.Errorf("no session ID received from MCP server")
 	}
-
-	sseCtx, cancel := context.WithCancel(ctx)
 
 	c.mu.Lock()
 	c.sessionID = sessionID
@@ -139,8 +159,9 @@ func (c *Client) Connect(ctx context.Context) error {
 func (c *Client) readSSE(body io.ReadCloser) {
 	defer body.Close()
 	defer c.setConnected(false)
-	
+
 	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 64*1024), 8<<20)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "data: ") {
@@ -149,17 +170,24 @@ func (c *Client) readSSE(body io.ReadCloser) {
 				ID *int64 `json:"id"`
 			}
 			if json.Unmarshal([]byte(data), &meta) == nil && meta.ID != nil {
+				// The lookup AND the send must happen under c.mu: Close()
+				// closes pending channels while holding that same lock, and
+				// sending outside the lock raced with Close → "send on
+				// closed channel" panic that took down the whole process
+				// (this goroutine is outside the HTTP recover middleware).
 				c.mu.Lock()
-				ch := c.pending[*meta.ID]
-				c.mu.Unlock()
-				if ch != nil {
+				if ch := c.pending[*meta.ID]; ch != nil {
 					select {
 					case ch <- json.RawMessage(data):
 					default:
 					}
 				}
+				c.mu.Unlock()
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("[mcp-client] SSE stream ended with error: %v", err)
 	}
 }
 
@@ -248,7 +276,7 @@ func (c *Client) sendRequest(ctx context.Context, method string, params any) (in
 	c.mu.Unlock()
 
 	messageURL := fmt.Sprintf("%s/message?sessionId=%s", strings.TrimRight(strings.Split(c.serverURL, "/sse")[0], "/"), c.sessionID)
-	
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, messageURL, strings.NewReader(string(body)))
 	if err != nil {
 		c.mu.Lock()
@@ -286,7 +314,7 @@ func (c *Client) sendNotification(method string, params any) error {
 	body, _ := json.Marshal(req)
 
 	messageURL := fmt.Sprintf("%s/message?sessionId=%s", strings.TrimRight(strings.Split(c.serverURL, "/sse")[0], "/"), c.sessionID)
-	
+
 	httpReq, err := http.NewRequest(http.MethodPost, messageURL, strings.NewReader(string(body)))
 	if err != nil {
 		return err

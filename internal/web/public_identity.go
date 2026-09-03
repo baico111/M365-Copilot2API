@@ -428,6 +428,10 @@ func (f *publicIdentityStreamFilter) Flush() string {
 const (
 	publicIdentityNeutralBufferLimit = 1024
 	publicIdentityNeutralTailBytes   = 256
+	// publicIdentityPatternHardLimit caps buffering while waiting for a safe
+	// cut point when the pending text itself keeps matching the identity
+	// pattern (e.g. a model repeating "I am ... Copilot" without endings).
+	publicIdentityPatternHardLimit = 512 << 10
 )
 
 func (f *publicIdentityStreamFilter) consume(final bool) string {
@@ -441,7 +445,12 @@ func (f *publicIdentityStreamFilter) consume(final bool) string {
 		f.pending = f.pending[end:]
 		return out
 	}
-	if len(f.pending) <= publicIdentityNeutralBufferLimit || publicSelfIdentityPattern.MatchString(f.pending) {
+	if len(f.pending) <= publicIdentityNeutralBufferLimit || (publicSelfIdentityPattern.MatchString(f.pending) && len(f.pending) <= publicIdentityPatternHardLimit) {
+		// Short pending: keep buffering (prefix of "Microsoft 365 Copilot" may
+		// arrive split across chunks). Identity-suspicious text: keep buffering
+		// so a raw provider name is never emitted — but bounded by the hard
+		// limit so pathological upstream (endless identity text with no cut
+		// point) cannot grow the buffer forever.
 		return ""
 	}
 	cut := len(f.pending) - publicIdentityNeutralTailBytes
@@ -496,8 +505,13 @@ func (f *publicReasoningStreamFilter) consume(final bool) string {
 		return sanitizePublicReasoningText(chunk)
 	}
 	if len(f.pending) > 4096 {
-		chunk := f.pending[:len(f.pending)-256]
-		f.pending = f.pending[len(f.pending)-256:]
+		cut := len(f.pending) - 256
+		// Mirror the identity filter: never split a multi-byte rune.
+		for cut > 0 && !utf8.RuneStart(f.pending[cut]) {
+			cut--
+		}
+		chunk := f.pending[:cut]
+		f.pending = f.pending[cut:]
 		return sanitizePublicReasoningText(chunk)
 	}
 	return ""

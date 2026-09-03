@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -90,19 +92,28 @@ type sessionRegistry struct {
 }
 
 type session struct {
-	id       string
+	id         string
 	providerMu sync.RWMutex
-	provider ToolProvider
-	created  time.Time
-	msgCh    chan json.RawMessage
-	done     chan struct{}
+	provider   ToolProvider
+	created    time.Time
+	msgCh      chan json.RawMessage
+	done       chan struct{}
 }
 
 // RegisterSession creates a new MCP session with the given tool provider and returns the session ID.
 func (r *sessionRegistry) RegisterSession(provider ToolProvider) string {
+	// Session IDs carry full control over the corresponding SSE stream
+	// (arbitrary message delivery). They must be unguessable: a clock-derived
+	// UnixNano id is enumerable by anyone holding a valid API key.
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		// crypto/rand failure is effectively impossible here; fall back to a
+		// monotonic-but-unique id rather than panicking the process.
+		return fmt.Sprintf("mcp-%d", time.Now().UnixNano())
+	}
+	id := "mcp-" + hex.EncodeToString(buf)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	id := fmt.Sprintf("mcp-%d", time.Now().UnixNano())
 	r.sessions[id] = &session{
 		id:       id,
 		provider: provider,
@@ -193,7 +204,9 @@ func HandleMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req jsonRPCRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Bound the JSON-RPC body like every other write endpoint: an
+	// authenticated client must not be able to force unbounded reads.
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
 		json.NewEncoder(w).Encode(newRPCError(nil, -32700, "parse error: "+err.Error()))
 		return
 	}

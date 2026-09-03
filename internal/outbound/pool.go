@@ -218,7 +218,30 @@ func (t *poolRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 		return resp, nil
 	}
 	// Replay the request on the next healthy proxy once (body must be replayable).
-	if r.Body != nil && r.GetBody == nil {
+	if r.Body == nil {
+		// GET/HEAD with no body: safe to retry directly; calling r.GetBody()
+		// unconditionally would panic because it is nil for bodiless requests.
+		t.pool.mu.Lock()
+		n := len(t.pool.entries) + 1
+		t.pool.mu.Unlock()
+		if n > 3 {
+			n = 3
+		}
+		for i := 0; i < n; i++ {
+			next := t.pool.pick()
+			if next == nil || next == t.entry {
+				break
+			}
+			retry := r.Clone(r.Context())
+			resp2, err2 := next.clients.HTTP.Transport.RoundTrip(retry)
+			t.pool.mark(next.raw, err2)
+			if err2 == nil {
+				return resp2, nil
+			}
+		}
+		return resp, err
+	}
+	if r.GetBody == nil {
 		return resp, err
 	}
 	t.pool.mu.Lock()

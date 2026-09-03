@@ -37,9 +37,9 @@ const (
 	defaultBinary    = "sing-box"
 
 	// Health check constants.
-	healthCheckInterval = 60 * time.Second  // check every 60s
-	healthCheckTimeout  = 10 * time.Second  // per-node check timeout
-	healthMaxFailures   = 3                  // consecutive failures before isolating
+	healthCheckInterval = 60 * time.Second // check every 60s
+	healthCheckTimeout  = 10 * time.Second // per-node check timeout
+	healthMaxFailures   = 3                // consecutive failures before isolating
 	healthCheckURL      = "https://www.gstatic.com/generate_204"
 )
 
@@ -47,10 +47,10 @@ var (
 	sbMu          sync.Mutex
 	sbConfig      *SingBoxConfig
 	sbProcess     *exec.Cmd
-	sbClients     *Clients         // clients pointed at the local sing-box SOCKS5 (urltest / fallback)
-	sbNodeClients map[int]*Clients // per-node clients: node index → Clients
-	sbNodeList    []string         // node names for status reporting
-	sbNodePorts   map[int]int      // node index → local SOCKS5 port
+	sbClients     *Clients            // clients pointed at the local sing-box SOCKS5 (urltest / fallback)
+	sbNodeClients map[int]*Clients    // per-node clients: node index → Clients
+	sbNodeList    []string            // node names for status reporting
+	sbNodePorts   map[int]int         // node index → local SOCKS5 port
 	sbNodeHealth  map[int]*nodeHealth // per-node health state
 	sbHealthStop  chan struct{}       // stop signal for health check goroutine
 )
@@ -101,16 +101,22 @@ func ConfigureSingBox(subscriptionURL string) error {
 	// Stop existing process, health checks, and clear stale clients
 	stopHealthChecks()
 	sbMu.Lock()
-	if sbProcess != nil && sbProcess.Process != nil {
-		_ = sbProcess.Process.Signal(os.Interrupt)
-		_ = sbProcess.Process.Kill()
-	}
+	oldProc := sbProcess
 	sbProcess = nil
 	sbClients = nil
 	sbNodeClients = nil
 	sbNodePorts = nil
 	sbNodeHealth = nil
 	sbMu.Unlock()
+	if oldProc != nil && oldProc.Process != nil {
+		_ = oldProc.Process.Signal(os.Interrupt)
+		_ = oldProc.Process.Kill()
+	}
+	// The previous implementation did not wait for the old process to exit.
+	// When sing-box is reconfigured while a previous instance is still
+	// winding down, the fresh instance fails to bind the shared local port
+	// (EADDRINUSE) and the whole proxy silently stays offline. Release it.
+	waitPortReleased(fmt.Sprintf("127.0.0.1:%d", cfg.LocalPort), 3*time.Second)
 
 	// CRITICAL: Validate config before starting sing-box.
 	// Running "sing-box check -c config.json" catches config errors
@@ -212,6 +218,21 @@ func ConfigureSingBox(subscriptionURL string) error {
 	return nil
 }
 
+// waitPortReleased polls until nothing listens on addr or timeout passes.
+// The check runs on localhost only, so dial latency is negligible; a refused
+// dial means the kernel has torn the listener down (or it never existed).
+func waitPortReleased(addr string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func StopSingBox() {
 	stopSingBox()
 }
@@ -261,20 +282,60 @@ func refreshLoop(cfg *SingBoxConfig) {
 			continue
 		}
 
-		// Start new sing-box process FIRST, then kill old one
-		// This avoids a window where no proxy is available.
+		// The old code started the new process BEFORE killing the old one
+		// "to avoid a gap" — but both bind the same LocalPort, so the new
+		// process always died on EADDRINUSE while the readiness probe
+		// happily connected to the OLD listener. The swap then killed the
+		// old owner and left sbClients pointing at a dead socket until the
+		// next 10-minute refresh: a guaranteed proxy-wide outage window.
+		// Correct order: stop old -> confirm the port is released -> start
+		// new -> verify it actually owns the port -> swap in clients.
+		socksAddr := fmt.Sprintf("127.0.0.1:%d", cfg.LocalPort)
+		sbMu.Lock()
+		oldCmd := sbProcess
+		sbProcess = nil
+		sbClients = nil
+		sbNodeClients = nil
+		sbNodePorts = nil
+		sbMu.Unlock()
+		if oldCmd != nil && oldCmd.Process != nil {
+			_ = oldCmd.Process.Signal(os.Interrupt)
+			// Give graceful shutdown a beat, then force-kill.
+			done := make(chan struct{})
+			go func(c *exec.Cmd) { _ = c.Wait(); close(done) }(oldCmd)
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				_ = oldCmd.Process.Kill()
+				<-done
+			}
+		}
+		// Wait until nothing is listening on the port any more.
+		released := false
+		for i := 0; i < 40; i++ {
+			conn, derr := net.Dial("tcp", socksAddr)
+			if derr != nil {
+				released = true
+				break
+			}
+			conn.Close()
+			time.Sleep(100 * time.Millisecond)
+		}
+		if !released {
+			log.Printf("[sing-box] reload: port %d still busy after old process stop; skipping this refresh", cfg.LocalPort)
+			continue
+		}
 		reloadCmd := exec.Command(cfg.BinaryPath, "run", "-c", configPath)
 		reloadCmd.Stdout = os.Stdout
 		reloadCmd.Stderr = os.Stderr
 		if err := reloadCmd.Start(); err != nil {
-			log.Printf("[sing-box] reload failed (old process kept): %v", err)
+			log.Printf("[sing-box] reload start failed (proxy left offline): %v", err)
 			continue
 		}
-		// Wait briefly for new process to bind the port
-		socksAddr := fmt.Sprintf("127.0.0.1:%d", cfg.LocalPort)
+		// Wait briefly for the NEW process to bind the port.
 		ready := false
 		for i := 0; i < 30; i++ {
-			if conn, err := net.Dial("tcp", socksAddr); err == nil {
+			if conn, derr := net.Dial("tcp", socksAddr); derr == nil {
 				conn.Close()
 				ready = true
 				break
@@ -282,8 +343,9 @@ func refreshLoop(cfg *SingBoxConfig) {
 			time.Sleep(200 * time.Millisecond)
 		}
 		if !ready {
-			log.Printf("[sing-box] reload: port %d not reachable, keeping old process", cfg.LocalPort)
 			_ = reloadCmd.Process.Kill()
+			_ = reloadCmd.Wait()
+			log.Printf("[sing-box] reload: new process failed to bind port %d; proxy offline until next refresh", cfg.LocalPort)
 			continue
 		}
 		// Build per-node clients for the refreshed node set
@@ -296,9 +358,7 @@ func refreshLoop(cfg *SingBoxConfig) {
 			nodePorts[i] = port
 			nodeHealthMap[i] = newNodeHealth()
 		}
-		// New process is ready — kill old one
 		sbMu.Lock()
-		oldCmd := sbProcess
 		sbProcess = reloadCmd
 		sbNodeList = nodeNames(selected)
 		sbClients = buildLocalSOCKS5Clients(cfg.LocalPort)
@@ -308,10 +368,6 @@ func refreshLoop(cfg *SingBoxConfig) {
 		sbMu.Unlock()
 		// Restart health checks for the new node set
 		startHealthChecks()
-		if oldCmd != nil && oldCmd.Process != nil {
-			_ = oldCmd.Process.Signal(os.Interrupt)
-			_ = oldCmd.Process.Kill()
-		}
 		log.Printf("[sing-box] refreshed with %d nodes", len(selected))
 		go func(c *exec.Cmd) {
 			err := c.Wait()
@@ -358,33 +414,44 @@ func buildLocalSOCKS5Clients(port int) *Clients {
 // ---- Subscription parsing ----
 
 type vlessNode struct {
-	UUID    string
-	Address string
-	Port    int
-	Network string // ws, tcp, etc.
-	TLS     bool
-	SNI     string
-	Host    string
-	Path    string
-	FP      string
-	Alpn    string
-	Name    string
-	Raw     string
-	Proto   string // vless, vmess, ss
+	UUID     string
+	Address  string
+	Port     int
+	Network  string // ws, tcp, etc.
+	TLS      bool
+	SNI      string
+	Host     string
+	Path     string
+	FP       string
+	Alpn     string
+	Name     string
+	Raw      string
+	Proto    string // vless, vmess, ss
 	SSMethod string // shadowsocks method
 	SSPass   string // shadowsocks password
 }
 
 func fetchSubscription(rawURL string) ([]vlessNode, error) {
+	// The URL comes from the operator config field; refuse file:// and any
+	// scheme the http client would otherwise resolve unexpectedly.
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil, fmt.Errorf("subscription URL must be http(s)")
+	}
 	client := &http.Client{Timeout: 30 * time.Second}
-	req, _ := http.NewRequest("GET", rawURL, nil)
+	// Err must not be ignored: a malformed subscription URL returns a nil req
+	// and the subsequent client.Do(req) would panic on the nil request.
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, err
 	}
@@ -773,7 +840,7 @@ func buildSingBoxOutbound(tag string, n vlessNode) map[string]any {
 	} else if n.Network == "grpc" {
 		// gRPC transport (used by some vless/vmess nodes).
 		grpcCfg := map[string]any{
-			"type":    "grpc",
+			"type":         "grpc",
 			"service_name": n.Path,
 		}
 		ob["transport"] = grpcCfg
@@ -897,14 +964,14 @@ func selectRandomNodes(nodes []vlessNode, max int) []vlessNode {
 
 // nodeHealth tracks the health state of a single sing-box node.
 type nodeHealth struct {
-	mu           sync.Mutex
-	health       string        // "healthy", "unhealthy", "checking"
-	failures     int           // consecutive failure count
-	latency      time.Duration // last measured latency
-	lastCheck    time.Time     // last check time
-	lastError    string        // last error message
-	isolated     bool          // true when node is skipped due to failures
-	isolatedAt   time.Time     // when isolation started
+	mu         sync.Mutex
+	health     string        // "healthy", "unhealthy", "checking"
+	failures   int           // consecutive failure count
+	latency    time.Duration // last measured latency
+	lastCheck  time.Time     // last check time
+	lastError  string        // last error message
+	isolated   bool          // true when node is skipped due to failures
+	isolatedAt time.Time     // when isolation started
 }
 
 // newnodeHealth creates a nodeHealth with default healthy state.

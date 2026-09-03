@@ -24,7 +24,7 @@ type apiKeyRecord struct {
 }
 type apiKeyStore struct {
 	mu      sync.Mutex
-	Path    string
+	Path    string         `json:"-"` // never deserialized: loading a hostile/corrupt file must not redirect where the store writes
 	Keys    []apiKeyRecord `json:"keys"`
 	persist *persistStore
 }
@@ -83,16 +83,23 @@ func (s *apiKeyStore) create(name string) (apiKeyRecord, string, error) {
 	s.mu.Lock()
 	s.Keys = append(s.Keys, r)
 	s.mu.Unlock()
-		if err := s.persist.flushNowBlocking(); err != nil {
-			s.mu.Lock()
-			s.Keys = s.Keys[:len(s.Keys)-1]
-			s.mu.Unlock()
-			return apiKeyRecord{}, "", err
+	if err := s.persist.flushNowBlocking(); err != nil {
+		// Roll back by ID: a concurrent create/delete may have moved the
+		// tail since our append, so s.Keys[:len-1] could drop the wrong key.
+		s.mu.Lock()
+		for i := range s.Keys {
+			if s.Keys[i].ID == r.ID {
+				s.Keys = append(s.Keys[:i], s.Keys[i+1:]...)
+				break
+			}
 		}
-		r.Hash = ""
-		r.Raw = ""
-		return r, raw, nil
+		s.mu.Unlock()
+		return apiKeyRecord{}, "", err
 	}
+	r.Hash = ""
+	r.Raw = ""
+	return r, raw, nil
+}
 func (s *apiKeyStore) list() []apiKeyRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -106,43 +113,68 @@ func (s *apiKeyStore) list() []apiKeyRecord {
 }
 func (s *apiKeyStore) revoke(id string) (bool, error) {
 	s.mu.Lock()
+	found := false
 	for i := range s.Keys {
 		if s.Keys[i].ID == id && !s.Keys[i].Revoked {
 			s.Keys[i].Revoked = true
-			s.mu.Unlock()
-			if err := s.persist.flushNowBlocking(); err != nil {
-				s.mu.Lock()
-				s.Keys[i].Revoked = false
-				s.mu.Unlock()
-				return false, err
-			}
-			return true, nil
+			found = true
+			break
 		}
 	}
 	s.mu.Unlock()
-	return false, nil
+	if !found {
+		return false, nil
+	}
+	if err := s.persist.flushNowBlocking(); err != nil {
+		// Roll back by ID — index i from before the unlock may point at a
+		// different record after concurrent create/delete.
+		s.mu.Lock()
+		for i := range s.Keys {
+			if s.Keys[i].ID == id {
+				s.Keys[i].Revoked = false
+				break
+			}
+		}
+		s.mu.Unlock()
+		return false, err
+	}
+	return true, nil
 }
 
 // delete physically removes a key record, rolling back on persistence failure.
 func (s *apiKeyStore) delete(id string) (bool, error) {
 	s.mu.Lock()
+	var removed *apiKeyRecord
 	for i := range s.Keys {
-		if s.Keys[i].ID != id {
-			continue
+		if s.Keys[i].ID == id {
+			cp := s.Keys[i]
+			removed = &cp
+			s.Keys = append(s.Keys[:i], s.Keys[i+1:]...)
+			break
 		}
-		removed := s.Keys[i]
-		s.Keys = append(s.Keys[:i], s.Keys[i+1:]...)
-		s.mu.Unlock()
-		if err := s.persist.flushNowBlocking(); err != nil {
-			s.mu.Lock()
-			s.Keys = append(s.Keys[:i], append([]apiKeyRecord{removed}, s.Keys[i:]...)...)
-			s.mu.Unlock()
-			return false, err
-		}
-		return true, nil
 	}
 	s.mu.Unlock()
-	return false, nil
+	if removed == nil {
+		return false, nil
+	}
+	if err := s.persist.flushNowBlocking(); err != nil {
+		// Re-add by value: the original index is stale after concurrent
+		// mutations, and slicing s.Keys[:i] with a stale i can panic.
+		s.mu.Lock()
+		exists := false
+		for i := range s.Keys {
+			if s.Keys[i].ID == removed.ID {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			s.Keys = append(s.Keys, *removed)
+		}
+		s.mu.Unlock()
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *apiKeyStore) update(id, name string, revoked *bool) (bool, error) {

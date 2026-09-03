@@ -85,13 +85,22 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 		return nil, false
 	}
 	out := make([]detectedToolCall, 0, len(envelope.Calls))
+	rejected := 0
 	for i, c := range envelope.Calls {
 		fn := toolFunction(c.Name, tools)
 		if fn == nil || c.Arguments == nil || !toolChoiceAllows(choice, c.Name) || schemaValid(c.Arguments, fn) != nil {
+			rejected++
 			continue
 		}
 		b, _ := json.Marshal(c.Arguments)
 		out = append(out, detectedToolCall{ID: callID(c.Name, string(b), i), Type: toolType(c.Name, tools), Name: c.Name, Arguments: b})
+	}
+	// If the model emitted call objects but EVERY one failed name/schema
+	// validation, this is NOT a usable decision: report unparsed so the
+	// caller runs its repair round instead of silently answering in prose
+	// (or 502-ing on tool_choice=required without a schema-informed retry).
+	if len(out) == 0 && rejected > 0 {
+		return nil, false
 	}
 	return out, true
 }
