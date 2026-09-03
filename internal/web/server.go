@@ -1428,6 +1428,11 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()
 	chatSettings := s.settings.get()
+	servingAccountID := acc.ID
+	opts := []chatCallOption{withServingAccount(&servingAccountID)}
+	if body.AccountID != "" {
+		opts = append(opts, withPinnedAccount())
+	}
 	res, err := s.chatWithAccount(ctx, acc.ID, chathub.Account{
 		AccessToken: acc.AccessToken,
 		OID:         acc.OID,
@@ -1444,7 +1449,12 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		PreviousMessages:      body.PreviousMessages,
 		ConnectedFederatedIDs: body.ConnectedFederatedIDs,
 		FeatureFlags:          s.featureFlags(),
-	})
+	}, opts...)
+	if servingAccountID != acc.ID {
+		if newAcc, ok := s.tokens.Get(servingAccountID); ok {
+			acc = newAcc
+		}
+	}
 	if err != nil {
 		originalErr := err
 		// Failover: iterate through ALL healthy accounts until one succeeds.
@@ -1466,6 +1476,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 				}
 				tried[next.ID] = true
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+				failoverServingID := next.ID
 				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{
 					Text:                  text,
 					Tone:                  body.Tone,
@@ -1478,8 +1489,13 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 					PreviousMessages:      body.PreviousMessages,
 					ConnectedFederatedIDs: body.ConnectedFederatedIDs,
 					FeatureFlags:          s.featureFlags(),
-				})
+				}, withServingAccount(&failoverServingID))
 				cancel2()
+				if failoverServingID != next.ID {
+					if newAcc, ok := s.tokens.Get(failoverServingID); ok {
+						next = newAcc
+					}
+				}
 				if err2 == nil {
 					s.accountPool.MarkSuccess(next.ID)
 					acc = next
@@ -2065,7 +2081,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// completed assistant turn with the actual call lost.
 		routePrompt := modelToolRouterPrompt(answerPrompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
-		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		routerOpts := []chatCallOption{}
+		if body.AccountID != "" {
+			routerOpts = append(routerOpts, withPinnedAccount())
+		}
+		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, routerOpts...)
 		log.Printf("[req-trace] id=%s stage=router_return elapsed_ms=%d err=%t", requestID, time.Since(startedAt).Milliseconds(), routeErr != nil)
 		// Router turns run in a throwaway cloud conversation that is never
 		// reused by the answer turn; delete it so the conversation list does
@@ -2081,7 +2101,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		calls = filterCompletedCalls(calls, ledger)
 		calls, _ = validateCalls("router", calls)
 		if !parsed {
-			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, routerOpts...)
 			if repairErr == nil && repairRes.ConversationID != "" {
 				s.dropTransientConversation(repairRes.ConversationID)
 			}
@@ -2104,7 +2124,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if body.Stream {
+	// The events path exists to detect structured tool calls mid-stream
+	// (native ChatHub tool events + fenced tool-call blocks), so it only
+	// engages when the client declared tools. Tool-less streaming requests
+	// fall through to the reasoning path below, which emits
+	// reasoning_content deltas — previously this block unconditionally
+	// swallowed every streaming request and returned, leaving the entire
+	// reasoning path below unreachable dead code.
+	if body.Stream && len(toolMaps) > 0 {
 		answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, mcpServerURL, s.settings.get(), s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession)
 		answerPrompt = answerReq.Text
 		log.Printf("[req-trace] id=%s stage=answer_start prompt_len=%d native_tools=%d mcp=%s", requestID, len(answerPrompt), len(answerReq.Tools), mcpServerURL)
@@ -2167,6 +2194,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			return nil
 		}
+		servingAccountID := acc.ID
+		opts := []chatCallOption{withServingAccount(&servingAccountID)}
+		if body.AccountID != "" {
+			opts = append(opts, withPinnedAccount())
+		}
 		res, err := s.chatWithAccountEvents(ctx, acc.ID, account, answerReq, func(ev chathub.StreamEvent) error {
 			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
 				streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
@@ -2183,20 +2215,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if strings.Contains(v, "```bash") || strings.Contains(v, "\"command\"") {
 				return nil
 			}
-			// If we see an opening ```, buffer until the closing ``` or until we're sure it's not a tool call.
+			// If we see an opening ```, buffer from the fence onward. Fenced
+			// blocks may be model-emitted tool calls, so nothing from the
+			// first fence onward is streamed until the stream completes and
+			// fencedToolCall detection has run; the tail is flushed by the
+			// post-stream emitText(pending.String()). IMPORTANT: keep the
+			// text AFTER a closed fence in the buffer too — dropping it
+			// (the old v[i:closeIdx] write) silently discarded everything a
+			// streaming client saw after the first code block.
 			if i := strings.Index(v, "```"); i >= 0 {
-				after := v[i+3:]
-				// If there's a closing ```, emit everything up to and including the block.
-				if j := strings.Index(after, "```"); j >= 0 {
-					closeIdx := i + 3 + j + 3
-					if err := emitText(v[:i]); err != nil {
-						return err
-					}
-					pending.Reset()
-					pending.WriteString(v[i:closeIdx])
-					return nil
-				}
-				// Opening ``` without closing yet: emit everything before it, keep the fence buffered.
 				if err := emitText(v[:i]); err != nil {
 					return err
 				}
@@ -2223,7 +2250,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				pending.WriteString(v[cut:])
 			}
 			return nil
-		})
+		}, opts...)
+		if servingAccountID != acc.ID {
+			if newAcc, ok := s.tokens.Get(servingAccountID); ok {
+				acc = newAcc
+			}
+		}
 		if err != nil && text.Len() == 0 && len(streamedTools) == 0 && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsRetryable(err) {
 			originalErr := err
 			// A throttled stream may retry on the next healthy account: only the
@@ -2240,6 +2272,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				defer cancel2()
+				failoverServingID := next.ID
 				res2, err2 := s.chatWithAccountEvents(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, func(ev chathub.StreamEvent) error {
 					if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
 						streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
@@ -2262,11 +2295,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 						pending.WriteString(v[i:])
 						return nil
 					}
-					if runeCount := utf8.RuneCountInString(v); runeCount > 8 {
+					if runeCount := utf8.RuneCountInString(v); runeCount > 3 {
 						cut := 0
 						seen := 0
 						for i := range v {
-							if seen == runeCount-8 {
+							if seen == runeCount-3 {
 								cut = i
 								break
 							}
@@ -2279,7 +2312,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 						pending.WriteString(v[cut:])
 					}
 					return nil
-				})
+				}, withServingAccount(&failoverServingID))
+				if failoverServingID != next.ID {
+					if newAcc, ok := s.tokens.Get(failoverServingID); ok {
+						next = newAcc
+					}
+				}
 				if err2 == nil {
 					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
@@ -2387,7 +2425,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// to exactly one of the tools the client actually declared.
 			repairPrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, "required") +
 				"\nREPAIR RULE: The previous upstream event selected an undeclared tool. Select one declared tool that performs the intended operation. Never return unknown_tool."
-			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+			repairOpts := []chatCallOption{}
+			if body.AccountID != "" {
+				repairOpts = append(repairOpts, withPinnedAccount())
+			}
+			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, repairOpts...)
 			if repairErr == nil {
 				repaired, parsed := parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 				if parsed {
@@ -2451,7 +2493,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// remains tool-agnostic; it only validates and serializes the decision.
 	if planningMode == "router" && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
 		routePrompt := modelToolRouterPrompt(answerPrompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
-		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		nsRouterOpts := []chatCallOption{}
+		if body.AccountID != "" {
+			nsRouterOpts = append(nsRouterOpts, withPinnedAccount())
+		}
+		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, nsRouterOpts...)
 		if routeErr != nil {
 			s.accountPool.MarkFailure(acc.ID, routeErr, s.getRateLimitCooldown())
 			if IsRetryable(routeErr) {
@@ -2459,7 +2505,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				if nerr == nil {
 					ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 					defer cancel2()
-					if res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}); err2 == nil {
+					if res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, nsRouterOpts...); err2 == nil {
 						routeRes, routeErr = res2, nil
 						acc = next
 						account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
@@ -2481,7 +2527,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 		if !parsed {
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Do not invent calls; use {"calls":[]} if unrecoverable. OUTPUT:
-` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, nsRouterOpts...)
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 			}
@@ -2509,7 +2555,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			retryText := `Select at least one required next tool call from FUNCTION_DEFINITIONS. Validate every argument against its schema. Return JSON only as {"calls":[{"name":"function_name","arguments":{}}]}.
 APPLICATION_REQUEST_AND_EVIDENCE:
 ` + prompt + "\n" + ledger.RouterContext() + "\nFUNCTION_DEFINITIONS:\n" + string(defs)
-			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, nsRouterOpts...)
 			if retryErr == nil {
 				calls, parsed = parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice)
 				calls = filterCompletedCalls(calls, ledger)
@@ -2613,7 +2659,17 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 			return onReasoning(reasoning)
 		}
-		res, err = s.chatWithAccountReasoning(ctx, acc.ID, account, answerReq, onDeltaWrapped, onReasoningWrapped)
+		servingAccountID := acc.ID
+		opts := []chatCallOption{withServingAccount(&servingAccountID)}
+		if body.AccountID != "" {
+			opts = append(opts, withPinnedAccount())
+		}
+		res, err = s.chatWithAccountReasoning(ctx, acc.ID, account, answerReq, onDeltaWrapped, onReasoningWrapped, opts...)
+		if servingAccountID != acc.ID {
+			if newAcc, ok := s.tokens.Get(servingAccountID); ok {
+				acc = newAcc
+			}
+		}
 		if err != nil && streamedReasoningLen == 0 && !convReused && body.AccountID == "" && (body.ConversationID == "" || body.ConversationID == resolvedConversationID) && IsRetryable(err) {
 			originalErr := err
 			next, nerr := s.nextHealthyAccount(acc.ID)
@@ -2625,7 +2681,13 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				}
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				defer cancel2()
-				if res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, onDeltaWrapped, onReasoningWrapped); err2 == nil {
+				failoverServingID := next.ID
+				if res2, err2 := s.chatWithAccountReasoning(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, onDeltaWrapped, onReasoningWrapped, withServingAccount(&failoverServingID)); err2 == nil {
+					if failoverServingID != next.ID {
+						if newAcc, ok := s.tokens.Get(failoverServingID); ok {
+							next = newAcc
+						}
+					}
 					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
 						s.accountPool.MarkImageLimited(acc.ID)
@@ -2677,61 +2739,61 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					s.accountPool.MarkImageLimited(acc.ID)
 				}
 			}
-	} else {
-		// If we already streamed reasoning or text, treat this as a
-		// successful (but incomplete) response with finish_reason="stop"
-		// instead of sending an error to the client.
-		// The chathub layer already attempted transport-level retry
-		// (before any text was streamed) and auto-continue (after
-		// text was streamed), so at this point the error is unrecoverable.
-		if streamedReasoningLen > 0 {
-			log.Printf("[req-trace] id=%s stage=stream_partial_complete reasoning=%d err=%v", requestID, streamedReasoningLen, err)
-			if !outbound.IsProxyIsolated(err) {
-				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
-			}
-			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
-				s.accountPool.MarkImageLimited(acc.ID)
-			}
-			if content := contentFilter.Flush(); content != "" {
-				_ = writeChunk(map[string]any{"content": content})
-			}
-			if reasoning := reasoningFilter.Flush(); reasoning != "" {
-				_ = writeChunk(map[string]any{"reasoning_content": reasoning})
-			}
 		} else {
-			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
-			if !outbound.IsProxyIsolated(err) {
-				s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+			// If we already streamed reasoning or text, treat this as a
+			// successful (but incomplete) response with finish_reason="stop"
+			// instead of sending an error to the client.
+			// The chathub layer already attempted transport-level retry
+			// (before any text was streamed) and auto-continue (after
+			// text was streamed), so at this point the error is unrecoverable.
+			if streamedReasoningLen > 0 {
+				log.Printf("[req-trace] id=%s stage=stream_partial_complete reasoning=%d err=%v", requestID, streamedReasoningLen, err)
+				if !outbound.IsProxyIsolated(err) {
+					s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+				}
+				if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(acc.ID)
+				}
+				if content := contentFilter.Flush(); content != "" {
+					_ = writeChunk(map[string]any{"content": content})
+				}
+				if reasoning := reasoningFilter.Flush(); reasoning != "" {
+					_ = writeChunk(map[string]any{"reasoning_content": reasoning})
+				}
+			} else {
+				log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
+				if !outbound.IsProxyIsolated(err) {
+					s.accountPool.MarkFailure(acc.ID, err, s.getRateLimitCooldown())
+				}
+				if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(acc.ID)
+				}
+				if convReused {
+					s.invalidateConvCache(convCacheSessionKey, acc.ID, convCacheModel)
+				}
+				msg := upstreamError(err)
+				if IsRateLimited(err) {
+					msg = "upstream is rate limiting; try again shortly"
+				}
+				if errors.Is(err, chathub.ErrOffensiveContent) {
+					msg = "M365 content policy flagged this request as offensive"
+				}
+				msg = sanitizePublicInternalText(msg)
+				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
 			}
-			if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
-				s.accountPool.MarkImageLimited(acc.ID)
-			}
-			if convReused {
-				s.invalidateConvCache(convCacheSessionKey, acc.ID, convCacheModel)
-			}
-			msg := upstreamError(err)
-			if IsRateLimited(err) {
-				msg = "upstream is rate limiting; try again shortly"
-			}
-			if errors.Is(err, chathub.ErrOffensiveContent) {
-				msg = "M365 content policy flagged this request as offensive"
-			}
-			msg = sanitizePublicInternalText(msg)
-			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": msg, "code": "rate_limit"}})+"\n\n")
 		}
-	}
-	pt := EstimateTokens(prompt)
-	ct := EstimateTokens(res.Text)
-	log.Printf("[usage] stream id=%s pt=%d ct=%d res.Text=%d", id, pt, ct, len(res.Text))
-	if err == nil && ct == 0 {
-		_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "upstream returned empty completion; the requested model may be unavailable for this tenant", "code": "upstream_error"}})+"\n\n")
-	}
-	// If we streamed content but got an error, use "stop" not "error"
-	// so the client treats the response as complete, not failed.
-	finish := "stop"
-	if err != nil && streamedReasoningLen == 0 {
-		finish = "error"
-	}
+		pt := EstimateTokens(prompt)
+		ct := EstimateTokens(res.Text)
+		log.Printf("[usage] stream id=%s pt=%d ct=%d res.Text=%d", id, pt, ct, len(res.Text))
+		if err == nil && ct == 0 {
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "upstream returned empty completion; the requested model may be unavailable for this tenant", "code": "upstream_error"}})+"\n\n")
+		}
+		// If we streamed content but got an error, use "stop" not "error"
+		// so the client treats the response as complete, not failed.
+		finish := "stop"
+		if err != nil && streamedReasoningLen == 0 {
+			finish = "error"
+		}
 		usageChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}, "usage": map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
 		if res.Throttling != nil {
 			usageChunk["x_m365_throttling"] = res.Throttling
@@ -2745,12 +2807,28 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			_ = sw2.raw(": m365-metrics " + mustJSON(res.Timestamps) + "\n\n")
 		}
 	} else {
-		res, err = s.chatWithAccount(ctx, acc.ID, account, answerReq)
+		servingAccountID := acc.ID
+		opts := []chatCallOption{withServingAccount(&servingAccountID)}
+		if body.AccountID != "" {
+			opts = append(opts, withPinnedAccount())
+		}
+		res, err = s.chatWithAccount(ctx, acc.ID, account, answerReq, opts...)
+		if servingAccountID != acc.ID {
+			if newAcc, ok := s.tokens.Get(servingAccountID); ok {
+				acc = newAcc
+			}
+		}
 		if IsEmptyCompletion(err) && tone != "magic" {
 			log.Printf("[tone-fallback] tone=%q returned empty, retrying with magic", tone)
 			magicReq := answerReq
 			magicReq.Tone = "magic"
-			if res2, err2 := s.chatWithAccount(ctx, acc.ID, account, magicReq); err2 == nil && res2.Text != "" {
+			magicServingID := acc.ID
+			if res2, err2 := s.chatWithAccount(ctx, acc.ID, account, magicReq, withServingAccount(&magicServingID)); err2 == nil && res2.Text != "" {
+				if magicServingID != acc.ID {
+					if newAcc, ok := s.tokens.Get(magicServingID); ok {
+						acc = newAcc
+					}
+				}
 				res = res2
 				err = nil
 			}
@@ -2768,16 +2846,22 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				}
 				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 				defer cancel2()
-				res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq)
-				if err2 == nil {
-					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
-					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
-						s.accountPool.MarkImageLimited(acc.ID)
-					}
-					s.accountPool.MarkSuccess(next.ID)
-					res = res2
-					acc = next
-					err = nil
+			failoverServingID := next.ID
+			res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, failoverReq, withServingAccount(&failoverServingID))
+			if failoverServingID != next.ID {
+				if newAcc, ok := s.tokens.Get(failoverServingID); ok {
+					next = newAcc
+				}
+			}
+			if err2 == nil {
+				s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
+				if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
+					s.accountPool.MarkImageLimited(acc.ID)
+				}
+				s.accountPool.MarkSuccess(next.ID)
+				res = res2
+				acc = next
+				err = nil
 				} else {
 					s.accountPool.MarkFailure(acc.ID, originalErr, s.getRateLimitCooldown())
 					if errors.Is(originalErr, chathub.ErrImageLimit) && s.accountPool != nil {
@@ -2840,10 +2924,14 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		model = "m365-copilot"
 	}
 	id := "chatcmpl-" + uuid.NewString()
+	ejectOpts := []chatCallOption{}
+	if body.AccountID != "" {
+		ejectOpts = append(ejectOpts, withPinnedAccount())
+	}
 	if len(toolMaps) > 0 && isToolRefusal(res.Text) {
 		log.Printf("[tool-eject] model refused tools, retrying with correction")
 		correction := "Your previous response incorrectly denied that caller tools are available. They are real, active, and callable on the caller's Windows machine. Call the appropriate tool now. Do not explain tool availability.\n\nUser request:\n" + prompt
-		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, ejectOpts...)
 		if err2 == nil && !isToolRefusal(res2.Text) {
 			res = res2
 		}
@@ -2851,7 +2939,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	if len(toolMaps) > 0 && isSandboxHallucination(res.Text) {
 		log.Printf("[sandbox-eject] model used code interpreter/sandbox, retrying with explicit tool instruction")
 		correction := "CRITICAL: You must NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. The caller has provided a bash tool that runs Windows PowerShell 5.1 on their local machine — use it to execute any commands or code. Do NOT say you cannot run code. Do NOT say you only have a Linux container. Do NOT say you have no Windows execution channel. You DO have a bash tool that runs on Windows. Call the bash tool NOW with the appropriate PowerShell command.\n\nUser request:\n" + prompt
-		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, ejectOpts...)
 		if err2 == nil && !isSandboxHallucination(res2.Text) {
 			res = res2
 		}
@@ -2885,11 +2973,15 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	// structured event that failed the declared-name/schema boundary.
 	if (planningMode == "native" || invalidDetectedTool) && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
 		routePrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
-		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+		nativeRouterOpts := []chatCallOption{}
+		if body.AccountID != "" {
+			nativeRouterOpts = append(nativeRouterOpts, withPinnedAccount())
+		}
+		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, nativeRouterOpts...)
 		if routeErr == nil {
 			calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
 			if !parsed {
-				repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario})
+				repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, nativeRouterOpts...)
 				if repairErr == nil {
 					calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 				}

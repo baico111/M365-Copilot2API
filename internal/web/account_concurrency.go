@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"m365-copilot2api/internal/chathub"
 	"m365-copilot2api/internal/outbound"
@@ -147,7 +148,8 @@ func stableHash(s string) uint64 {
 	return h
 }
 
-func (s *Server) chatWithAccount(ctx context.Context, accountID string, account chathub.Account, request chathub.Request) (chathub.Result, error) {
+func (s *Server) chatWithAccount(ctx context.Context, accountID string, account chathub.Account, request chathub.Request, opts ...chatCallOption) (chathub.Result, error) {
+	cfg := applyChatCallOptions(opts)
 	release, err := s.accountConcurrency.Acquire(ctx, accountID)
 	if err != nil {
 		return chathub.Result{}, err
@@ -161,8 +163,9 @@ func (s *Server) chatWithAccount(ctx context.Context, accountID string, account 
 
 	// Transport-level retry for non-streaming requests. Since there is
 	// no streaming callback, there is no risk of duplicate content.
-	// Retry any transport-level error with a different account.
-	if err != nil && IsRetryable(err) {
+	// Retry any transport-level error with a different account — but only
+	// for context-free requests (see requestHasConversationState).
+	if err != nil && IsRetryable(err) && !cfg.pinned && !requestHasConversationState(request) {
 		tried := map[string]bool{accountID: true}
 		for attempt := 0; attempt < maxTransportRetries; attempt++ {
 			next, nerr := s.nextHealthyAccountMulti(tried)
@@ -171,15 +174,18 @@ func (s *Server) chatWithAccount(ctx context.Context, accountID string, account 
 			}
 			tried[next.ID] = true
 			log.Printf("[transport-retry] chat: account %s -> %s (attempt %d) err=%v", accountID, next.ID, attempt+1, err)
-			release2, err2 := s.accountConcurrency.Acquire(ctx, next.ID)
-			if err2 != nil {
+			retryCtx, retryCancel := s.retryContext(ctx)
+			release2, acqErr := s.accountConcurrency.Acquire(retryCtx, next.ID)
+			if acqErr != nil {
+				retryCancel()
 				continue
 			}
 			if s.accountPool != nil {
 				s.accountPool.MarkCall(next.ID)
 			}
 			nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
-			result2, err2 := s.accountClient(next.ID).Chat(ctx, nextAccount, request)
+			result2, err2 := s.accountClient(next.ID).Chat(retryCtx, nextAccount, request)
+			retryCancel()
 			release2()
 			s.markAccountResult(next.ID, err2)
 			if err2 == nil {
@@ -187,6 +193,9 @@ func (s *Server) chatWithAccount(ctx context.Context, accountID string, account 
 					s.accountPool.MarkFailure(accountID, err, s.getRateLimitCooldown())
 				}
 				s.accountPool.MarkSuccess(next.ID)
+				if cfg.servingAccountID != nil {
+					*cfg.servingAccountID = next.ID
+				}
 				return result2, nil
 			}
 			if !outbound.IsProxyIsolated(err2) {
@@ -210,7 +219,90 @@ func (s *Server) chatWithAccount(ctx context.Context, accountID string, account 
 // so the retry path only activates when streamedLen == 0.
 const maxTransportRetries = 2
 
-func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, account chathub.Account, request chathub.Request, onEvent func(chathub.StreamEvent) error) (chathub.Result, error) {
+// chatCallOption customizes transport-level retry behavior for the
+// chatWithAccount* family. Existing call sites are unaffected (defaults
+// keep the historical behavior for context-free one-shot calls).
+type chatCallOption func(*chatCallConfig)
+
+type chatCallConfig struct {
+	// servingAccountID, when non-nil, receives the ID of the account that
+	// actually served the request after a transport-level retry switched
+	// accounts. Callers that bind conversations to accounts MUST pass this
+	// (via withServingAccount) and re-resolve the account when it differs
+	// from the requested one — otherwise the conversation gets bound to an
+	// account that never saw it and the next turn silently loses context.
+	servingAccountID *string
+	// pinned disables account switching entirely. Used for explicitly
+	// account-bound requests where honoring the caller's account choice
+	// matters more than transport resilience.
+	pinned bool
+}
+
+// withServingAccount tracks the account that actually served the request.
+func withServingAccount(id *string) chatCallOption {
+	return func(c *chatCallConfig) { c.servingAccountID = id }
+}
+
+// withPinnedAccount forbids switching to a different account on retry.
+func withPinnedAccount() chatCallOption {
+	return func(c *chatCallConfig) { c.pinned = true }
+}
+
+func applyChatCallOptions(opts []chatCallOption) chatCallConfig {
+	var cfg chatCallConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	return cfg
+}
+
+// requestHasConversationState reports whether the request is bound to an
+// existing ChatHub conversation. Such requests must NOT switch accounts on
+// transport retry: another account cannot see that conversation, so a
+// switch silently loses all accumulated context. Those requests rely on
+// the server-layer failover (which clears ConversationID when switching).
+func requestHasConversationState(request chathub.Request) bool {
+	return request.ConversationID != "" || request.SessionID != ""
+}
+
+// retryContext returns a context for a transport-retry attempt. Reusing the
+// caller's context directly would inherit a mostly-consumed deadline — a
+// first attempt that hung until its WS timeout leaves the retry only
+// seconds to live, defeating the purpose. When the remaining budget is
+// under half the configured chat timeout, derive a fresh deadline; client
+// disconnects (context.Canceled) still cancel the retry, while a
+// DeadlineExceeded from the exhausted first attempt does not (the retry
+// deserves its own full window, matching the server-layer failover which
+// always builds a fresh WithTimeout off the request context).
+func (s *Server) retryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := time.Duration(s.settings.get().ChatTimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 8 * time.Minute
+	}
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) >= timeout/2 {
+		return ctx, func() {}
+	}
+	base, cancelBase := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-ctx.Done():
+			if ctx.Err() == context.Canceled {
+				cancelBase() // client went away mid-retry
+			}
+		case <-base.Done():
+		}
+	}()
+	timed, cancelTimed := context.WithTimeout(base, timeout)
+	return timed, func() {
+		cancelTimed()
+		cancelBase()
+	}
+}
+
+func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, account chathub.Account, request chathub.Request, onEvent func(chathub.StreamEvent) error, opts ...chatCallOption) (chathub.Result, error) {
+	cfg := applyChatCallOptions(opts)
 	// Track whether any text has been streamed to the client. If the
 	// upstream connection fails before any text flows, we can safely retry
 	// with a different account (and thus a different exit IP) without
@@ -237,10 +329,9 @@ func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, ac
 	// Transport-level retry: if the error is retryable (proxy drop, timeout,
 	// etc.) and NO text was streamed, retry with a different account.
 	// This is transparent to the client because nothing was sent yet.
-	// We only retry auto-selected accounts (not explicitly bound ones)
-	// and only when no text was streamed, so there is zero content
-	// duplication.
-	if err != nil && atomic.LoadInt64(&streamedLen) == 0 && IsRetryable(err) {
+	// Conversation-bound requests never switch here (context loss), and
+	// pinned (explicitly selected) accounts are respected.
+	if err != nil && atomic.LoadInt64(&streamedLen) == 0 && IsRetryable(err) && !cfg.pinned && !requestHasConversationState(request) {
 		tried := map[string]bool{accountID: true}
 		for attempt := 0; attempt < maxTransportRetries; attempt++ {
 			next, nerr := s.nextHealthyAccountMulti(tried)
@@ -249,8 +340,10 @@ func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, ac
 			}
 			tried[next.ID] = true
 			log.Printf("[transport-retry] events: account %s -> %s (attempt %d) err=%v", accountID, next.ID, attempt+1, err)
-			release2, err2 := s.accountConcurrency.Acquire(ctx, next.ID)
-			if err2 != nil {
+			retryCtx, retryCancel := s.retryContext(ctx)
+			release2, acqErr := s.accountConcurrency.Acquire(retryCtx, next.ID)
+			if acqErr != nil {
+				retryCancel()
 				continue
 			}
 			if s.accountPool != nil {
@@ -259,7 +352,8 @@ func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, ac
 			nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
 			// Reset streamedLen for the new attempt — no text was sent.
 			atomic.StoreInt64(&streamedLen, 0)
-			result2, err2 := s.accountClient(next.ID).ChatWithEvents(ctx, nextAccount, request, wrappedOnEvent)
+			result2, err2 := s.accountClient(next.ID).ChatWithEvents(retryCtx, nextAccount, request, wrappedOnEvent)
+			retryCancel()
 			release2()
 			s.markAccountResult(next.ID, err2)
 			if err2 == nil {
@@ -268,6 +362,9 @@ func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, ac
 					s.accountPool.MarkFailure(accountID, err, s.getRateLimitCooldown())
 				}
 				s.accountPool.MarkSuccess(next.ID)
+				if cfg.servingAccountID != nil {
+					*cfg.servingAccountID = next.ID
+				}
 				return result2, nil
 			}
 			// This attempt also failed. If still no text streamed, try next account.
@@ -289,7 +386,8 @@ func (s *Server) chatWithAccountEvents(ctx context.Context, accountID string, ac
 	return result, err
 }
 
-func (s *Server) chatWithAccountReasoning(ctx context.Context, accountID string, account chathub.Account, request chathub.Request, onDelta, onReasoning func(string) error) (chathub.Result, error) {
+func (s *Server) chatWithAccountReasoning(ctx context.Context, accountID string, account chathub.Account, request chathub.Request, onDelta, onReasoning func(string) error, opts ...chatCallOption) (chathub.Result, error) {
+	cfg := applyChatCallOptions(opts)
 	// Track whether any text/reasoning has been streamed to the client.
 	// If the upstream connection fails before any text flows, we can
 	// safely retry with a different account.
@@ -319,7 +417,7 @@ func (s *Server) chatWithAccountReasoning(ctx context.Context, accountID string,
 	s.markAccountResult(accountID, err)
 
 	// Transport-level retry: same logic as chatWithAccountEvents.
-	if err != nil && atomic.LoadInt64(&streamedLen) == 0 && IsRetryable(err) {
+	if err != nil && atomic.LoadInt64(&streamedLen) == 0 && IsRetryable(err) && !cfg.pinned && !requestHasConversationState(request) {
 		tried := map[string]bool{accountID: true}
 		for attempt := 0; attempt < maxTransportRetries; attempt++ {
 			next, nerr := s.nextHealthyAccountMulti(tried)
@@ -328,8 +426,10 @@ func (s *Server) chatWithAccountReasoning(ctx context.Context, accountID string,
 			}
 			tried[next.ID] = true
 			log.Printf("[transport-retry] reasoning: account %s -> %s (attempt %d) err=%v", accountID, next.ID, attempt+1, err)
-			release2, err2 := s.accountConcurrency.Acquire(ctx, next.ID)
-			if err2 != nil {
+			retryCtx, retryCancel := s.retryContext(ctx)
+			release2, acqErr := s.accountConcurrency.Acquire(retryCtx, next.ID)
+			if acqErr != nil {
+				retryCancel()
 				continue
 			}
 			if s.accountPool != nil {
@@ -337,7 +437,8 @@ func (s *Server) chatWithAccountReasoning(ctx context.Context, accountID string,
 			}
 			nextAccount := chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
 			atomic.StoreInt64(&streamedLen, 0)
-			result2, err2 := s.accountClient(next.ID).ChatWithReasoning(ctx, nextAccount, request, wrappedOnDelta, wrappedOnReasoning)
+			result2, err2 := s.accountClient(next.ID).ChatWithReasoning(retryCtx, nextAccount, request, wrappedOnDelta, wrappedOnReasoning)
+			retryCancel()
 			release2()
 			s.markAccountResult(next.ID, err2)
 			if err2 == nil {
@@ -345,6 +446,9 @@ func (s *Server) chatWithAccountReasoning(ctx context.Context, accountID string,
 					s.accountPool.MarkFailure(accountID, err, s.getRateLimitCooldown())
 				}
 				s.accountPool.MarkSuccess(next.ID)
+				if cfg.servingAccountID != nil {
+					*cfg.servingAccountID = next.ID
+				}
 				return result2, nil
 			}
 			if atomic.LoadInt64(&streamedLen) == 0 && IsRetryable(err2) {

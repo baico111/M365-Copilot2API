@@ -1184,7 +1184,21 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 		continueReq.SessionID = req.SessionID
 		// Create a fresh context for the continue request so it gets a
 		// full deadline, not the remains of the parent's exhausted one.
-		continueCtx, continueCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		// But inherit client cancellation: if the client went away
+		// (ctx.Canceled), abort the continue instead of burning a full
+		// 10-minute cycle against an account the user will never see.
+		continueBase, continueBaseCancel := context.WithCancel(context.Background())
+		defer continueBaseCancel()
+		go func() {
+			select {
+			case <-ctx.Done():
+				if ctx.Err() == context.Canceled {
+					continueBaseCancel()
+				}
+			case <-continueBase.Done():
+			}
+		}()
+		continueCtx, continueCancel := context.WithTimeout(continueBase, 10*time.Minute)
 		defer continueCancel()
 		// The second call gets its own deadline; onDelta is the same
 		// callback so streamed content flows to the client seamlessly.

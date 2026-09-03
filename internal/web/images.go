@@ -101,7 +101,17 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		endpoint = "/v1/images/edits"
 		prompt = fmt.Sprintf("Edit the first attached image with GPT Image 2. Size: %s. Instructions: %s. Preserve everything not requested to change. Return the edited image URL directly.", size, b.Prompt)
 	}
-	res, err := s.chatWithAccount(ctx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{Text: prompt, Tone: "magic", Attachments: b.Attachments, LicenseType: s.settings.get().LicenseType, Scenario: s.settings.get().Scenario, FeatureFlags: s.featureFlags()})
+	servingAccountID := acc.ID
+	opts := []chatCallOption{withServingAccount(&servingAccountID)}
+	if b.AccountID != "" {
+		opts = append(opts, withPinnedAccount())
+	}
+	res, err := s.chatWithAccount(ctx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{Text: prompt, Tone: "magic", Attachments: b.Attachments, LicenseType: s.settings.get().LicenseType, Scenario: s.settings.get().Scenario, FeatureFlags: s.featureFlags()}, opts...)
+	if servingAccountID != acc.ID {
+		if newAcc, ok := s.tokens.Get(servingAccountID); ok {
+			acc = newAcc
+		}
+	}
 	if err != nil {
 		writeUpstreamError(w, err)
 		return

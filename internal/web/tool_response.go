@@ -47,7 +47,12 @@ func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, sen
 			isLast := i == len(calls)-1
 			emit(base(map[string]any{"tool_calls": []any{map[string]any{"index": i, "id": tc.ID, "type": typ, "function": map[string]any{"name": tc.Name, "arguments": ""}}}}, nil))
 			args := string(tc.Arguments)
-			for off := 0; off < len(args); off += chunkSize {
+			// Chunk boundaries must advance to `end` (the UTF-8-aligned offset),
+			// never a fixed off+chunkSize: when a multi-byte rune straddles the
+			// 512-byte boundary `end` is pushed past off+chunkSize, and advancing
+			// by chunkSize alone re-emits the overlapping bytes — corrupting the
+			// JSON arguments the client reassembles.
+			for off := 0; off < len(args); {
 				end := off + chunkSize
 				if end > len(args) {
 					end = len(args)
@@ -56,12 +61,13 @@ func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, sen
 					end++
 				}
 				argChunk := args[off:end]
-				isLastArgChunk := off+chunkSize >= len(args)
+				isLastArgChunk := end >= len(args)
 				var finish any
 				if isLast && isLastArgChunk {
 					finish = "tool_calls"
 				}
 				emit(base(map[string]any{"tool_calls": []any{map[string]any{"index": i, "function": map[string]any{"arguments": argChunk}}}}, finish))
+				off = end
 			}
 			if len(args) == 0 && isLast {
 				emit(base(map[string]any{}, "tool_calls"))

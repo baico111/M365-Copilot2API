@@ -55,12 +55,22 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()
 	streamSettings := s.settings.get()
+	servingAccountID := acc.ID
+	opts := []chatCallOption{withServingAccount(&servingAccountID)}
+	if body.AccountID != "" {
+		opts = append(opts, withPinnedAccount())
+	}
 	res, err := s.chatWithAccount(ctx, acc.ID, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{
 		Text: text, Tone: body.Tone, ConversationID: body.ConversationID, SessionID: body.SessionID, Attachments: body.Attachments,
 		LicenseType: streamSettings.LicenseType, Scenario: streamSettings.Scenario,
 		ConversationSignature: body.ConversationSignature, PreviousMessages: body.PreviousMessages, ConnectedFederatedIDs: body.ConnectedFederatedIDs,
 		FeatureFlags: s.featureFlags(),
-	})
+	}, opts...)
+	if servingAccountID != acc.ID {
+		if newAcc, ok := s.tokens.Get(servingAccountID); ok {
+			acc = newAcc
+		}
+	}
 	if err != nil {
 		if errors.Is(err, chathub.ErrImageLimit) && s.accountPool != nil {
 			s.accountPool.MarkImageLimited(acc.ID)
