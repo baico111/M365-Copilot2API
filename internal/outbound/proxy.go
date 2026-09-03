@@ -230,6 +230,31 @@ func New(raw string) (*Clients, error) {
 
 type httpsProxyDialer struct{ proxyURL *url.URL }
 
+// HTTPS proxy dial phase timeouts. Each phase has its own independent cap so
+// a single slow proxy node does not consume the entire request budget through
+// one hanging phase while other phases would have succeeded.
+const (
+	httpsProxyTCPTimeout   = 10 * time.Second
+	httpsProxyTLSTimeout   = 10 * time.Second
+	httpsProxyCONNECTTimeout = 8 * time.Second
+)
+
+// minDeadline returns the shorter of ctx's deadline (if any) and d. If ctx has
+// no deadline, returns d. Used to bound each phase by the parent's remaining
+// budget while capping at the phase's own maximum.
+func minDeadline(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if dl, ok := ctx.Deadline(); ok {
+		remaining := time.Until(dl)
+		if remaining <= 0 {
+			return context.WithTimeout(context.Background(), 1*time.Millisecond) // already expired
+		}
+		if remaining < d {
+			d = remaining
+		}
+	}
+	return context.WithTimeout(context.Background(), d)
+}
+
 func (d httpsProxyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if network != "tcp" {
 		return nil, fmt.Errorf("HTTPS proxy only supports tcp, got %q", network)
@@ -238,19 +263,36 @@ func (d httpsProxyDialer) DialContext(ctx context.Context, network, address stri
 	if d.proxyURL.Port() == "" {
 		a = net.JoinHostPort(d.proxyURL.Hostname(), "443")
 	}
-	raw, e := (&net.Dialer{}).DialContext(ctx, network, a)
+
+	// Phase 1: TCP connect to proxy endpoint (independent timeout).
+	tcpCtx, tcpCancel := minDeadline(ctx, httpsProxyTCPTimeout)
+	defer tcpCancel()
+	raw, e := (&net.Dialer{}).DialContext(tcpCtx, network, a)
 	if e != nil {
 		return nil, e
 	}
+
+	// Phase 2: TLS handshake to proxy (independent timeout).
 	// Proxy endpoints commonly present a certificate for their hostname while users
 	// configure an IP address. This option affects only the TLS hop to the proxy;
 	// target-site certificate verification remains enabled.
 	insecureProxyTLS := os.Getenv("M365_PROXY_INSECURE_TLS") == "1" || os.Getenv("M365_PROXY_INSECURE_TLS") == "true" || net.ParseIP(d.proxyURL.Hostname()) != nil
 	conn := tls.Client(raw, &tls.Config{ServerName: d.proxyURL.Hostname(), MinVersion: tls.VersionTLS12, InsecureSkipVerify: insecureProxyTLS}) // #nosec G402 -- explicitly scoped to configured proxy TLS
-
-	if e = conn.HandshakeContext(ctx); e != nil {
+	tlsCtx, tlsCancel := minDeadline(ctx, httpsProxyTLSTimeout)
+	defer tlsCancel()
+	if e = conn.HandshakeContext(tlsCtx); e != nil {
 		raw.Close()
 		return nil, e
+	}
+
+	// Phase 3: Send CONNECT request and read response (independent timeout).
+	// Write deadline also covers the CONNECT response read so the proxy hanging
+	// after accepting the TCP connection does not stall indefinitely.
+	connectCtx, connectCancel := minDeadline(ctx, httpsProxyCONNECTTimeout)
+	defer connectCancel()
+	if dl, ok := connectCtx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+		defer conn.SetDeadline(time.Time{})
 	}
 	q := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: address}, Host: address, Header: make(http.Header)}
 	if d.proxyURL.User != nil {
@@ -258,20 +300,24 @@ func (d httpsProxyDialer) DialContext(ctx context.Context, network, address stri
 		q.SetBasicAuth(d.proxyURL.User.Username(), pw)
 	}
 	if e = q.Write(conn); e != nil {
+		_ = conn.SetDeadline(time.Time{})
 		conn.Close()
 		return nil, e
 	}
 	rd := bufio.NewReader(conn)
 	resp, e := http.ReadResponse(rd, q)
 	if e != nil {
+		_ = conn.SetDeadline(time.Time{})
 		conn.Close()
 		return nil, e
 	}
 	if resp.StatusCode != http.StatusOK {
+		_ = conn.SetDeadline(time.Time{})
 		resp.Body.Close()
 		conn.Close()
 		return nil, fmt.Errorf("HTTPS proxy CONNECT %s: %s", address, resp.Status)
 	}
+	_ = conn.SetDeadline(time.Time{})
 	return &bufferedConn{Conn: conn, reader: rd}, nil
 }
 

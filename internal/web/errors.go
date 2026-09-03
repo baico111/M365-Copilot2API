@@ -127,7 +127,11 @@ func writeUpstreamErrorWithAccount(w http.ResponseWriter, err error, accountID s
 		return
 	}
 	if IsEmptyCompletion(err) {
-		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned empty completion; the requested model may be unavailable for this tenant")
+		// Empty completion is NOT a gateway/network error — it indicates the
+		// upstream established a WS connection but produced no content. Return
+		// 503 with a distinct error code so clients do not treat it as a
+		// transient 502 and blindly retry.
+		writeOpenAIError(w, http.StatusServiceUnavailable, "empty_completion", "upstream returned no conversation content; the requested model may be unavailable for this tenant or the conversation may be misrouted")
 		return
 	}
 	if errors.Is(err, chathub.ErrOffensiveContent) {
@@ -137,34 +141,45 @@ func writeUpstreamErrorWithAccount(w http.ResponseWriter, err error, accountID s
 	writeOpenAIError(w, status, "upstream_error", upstreamError(err))
 }
 
-// IsRetryable returns true for errors that warrant a failover attempt on
-// the next healthy account: rate limits, auth failures, and all transport
-// errors (DNS, TCP, TLS, WebSocket handshake/read timeout, etc.).
-// Forbidden 403 that is not ErrorDisallowedAADUser is also retried because
-// it can be a transient edge node rejection. UserBanned is never retried.
+// IsRetryable returns true only for transient network-layer errors that may
+// resolve by switching to a different account / egress path. Explicit
+// whitelist — everything else returns false, so a single failure is NOT
+// amplified into repeated failovers across multiple accounts.
+//
+// Retriable: TCP reset, connection refused, DNS failure, TLS handshake,
+// SOCKS5 drop, WS handshake/read timeout, upstream 429/503, 422.
+// NOT retriable: empty completion, content policy block, image limit,
+// auth failure (401/403), user-banned, client-canceled, unknown.
 func IsRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
 	cat := ClassifyError(err)
 	switch cat {
-	case CategoryQuota429, CategoryOverload503, CategoryRetryable422,
-		CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS,
-		CategoryWSHandshake, CategoryWSReadTimeout, CategoryUpstreamStructured,
-		CategoryGlobalUnavailable, CategoryAuthExpired401:
+	// Transient upstream saturation — may succeed on another account.
+	case CategoryQuota429, CategoryOverload503, CategoryRetryable422:
+		return true
+	// Transport-level errors — switching egress path may resolve.
+	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS,
+		CategoryWSHandshake, CategoryWSReadTimeout:
 		return true
 	case CategoryForbidden403:
-		// ErrorDisallowedAADUser is a permanent Designer-disabled state, not retryable.
-		// Other 403s may be transient edge-node rejections.
+		// ErrorDisallowedAADUser is a permanent Designer-disabled state.
+		// Other 403s may be transient edge-node rejections on another account.
 		var httpErr *UpstreamHTTPError
 		if errors.As(err, &httpErr) && httpErr.ErrorCode == "ErrorDisallowedAADUser" {
 			return false
 		}
 		return true
-	case CategoryUserBanned, CategoryClientCanceled:
-		return false
+	// Everything else is NOT retriable:
+	// - CategoryUpstreamStructured (empty completion, offensive content, image limit)
+	// - CategoryAuthExpired401 (token refresh may help, but server-layer failover handles this)
+	// - CategoryGlobalUnavailable (circuit open — retry only extends outage)
+	// - CategoryUserBanned, CategoryClientCanceled
+	// - CategoryUnknown — previously returned true, causing ALL unclassified
+	//   errors to trigger failover storms. Now explicitly false.
 	default:
-		return true
+		return false
 	}
 }
 
@@ -205,7 +220,11 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 		return
 	}
 	if IsEmptyCompletion(err) {
-		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned empty completion; the requested model may be unavailable for this tenant")
+		// Empty completion is NOT a gateway/network error — it indicates the
+		// upstream established a WS connection but produced no content. Return
+		// 503 with a distinct error code so clients do not treat it as a
+		// transient 502 and blindly retry.
+		writeOpenAIError(w, http.StatusServiceUnavailable, "empty_completion", "upstream returned no conversation content; the requested model may be unavailable for this tenant or the conversation may be misrouted")
 		return
 	}
 	if errors.Is(err, chathub.ErrOffensiveContent) {

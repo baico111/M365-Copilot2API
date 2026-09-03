@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,13 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// disableWSPool is set via M365_DISABLE_WS_POOL=1 to bypass connection pooling.
+// Pooling ignores the per-request wsURL (which carries sessionID, conversationID,
+// requestID, and access_token), so a warmed connection can be reused by a request
+// bound to a different session — causing empty completions, 502s, or silent
+// conversation routing errors. Disable it for A/B verification.
+var disableWSPool = os.Getenv("M365_DISABLE_WS_POOL") == "1"
 
 type pooledConn struct {
 	conn      *websocket.Conn
@@ -41,6 +49,10 @@ func NewConnPool(dialer *websocket.Dialer, header http.Header) *ConnPool {
 		dialer: dialer,
 		header: header,
 		stop:   make(chan struct{}),
+	}
+	if disableWSPool {
+		log.Printf("[connpool] WebSocket connection pooling DISABLED (M365_DISABLE_WS_POOL=1)")
+		return p
 	}
 	go p.gcLoop()
 	return p
@@ -103,6 +115,16 @@ func (p *ConnPool) evict(key string, target *pooledConn) {
 
 func (p *ConnPool) Take(ctx context.Context, oid, tid string, wsURL string) (*websocket.Conn, *sync.Mutex, <-chan []byte, <-chan error, bool, error) {
 	_ = wsURL
+	if disableWSPool {
+		conn, resp, err := p.dialer.DialContext(ctx, wsURL, p.header.Clone())
+		if err != nil {
+			if resp != nil {
+				log.Printf("[connpool] dial failed oid=%s status=%d", oid, resp.StatusCode)
+			}
+			return nil, nil, nil, nil, false, err
+		}
+		return conn, nil, nil, nil, false, nil
+	}
 	p.mu.Lock()
 	key := p.key(oid, tid)
 	conns := p.conns[key]
@@ -149,7 +171,7 @@ func (p *ConnPool) Take(ctx context.Context, oid, tid string, wsURL string) (*we
 }
 
 func (p *ConnPool) Warm(ctx context.Context, acc Account, wsURL string) {
-	if wsURL == "" {
+	if wsURL == "" || disableWSPool {
 		return
 	}
 	key := p.key(acc.OID, acc.TID)

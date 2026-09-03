@@ -167,6 +167,11 @@ const (
 	// base64-encoded and held in memory alongside the multipart body.
 	maxAttachments   = 10
 	maxAttachmentMiB = 10
+	// wsReadIdleTimeout is the idle timeout between WebSocket frames. It is
+	// refreshed after every successful read so a slow-but-active upstream
+	// (long reasoning, streaming tool calls) is not killed. Must be long
+	// enough to accommodate the longest expected gap between upstream frames.
+	wsReadIdleTimeout = 60 * time.Second
 )
 
 // Variants mirrored from the verified browser / Python probe.
@@ -358,6 +363,11 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 // responses, and multiple attempts increase the risk of duplicate content.
 const maxAutoContinue = 1
 
+// maxContinueTimeout bounds how long an auto-continue can run. It inherits
+// the original request's remaining deadline but never exceeds this cap, so
+// a 5-minute client timeout does not trigger a 10-minute continuation burn.
+const maxContinueTimeout = 2 * time.Minute
+
 // chatDeadlineFromCtx derives the internal deadline from the context's
 // deadline, leaving a 10-second safety margin so the auto-continue path
 // triggers BEFORE ctx.Done() kills the request. If the context has no
@@ -496,7 +506,10 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 		}
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+	// Initial read deadline; it is also refreshed after every successful
+	// read in the read goroutine below so long-running reasoning is not
+	// killed by a fixed post-handshake cap.
+	_ = conn.SetReadDeadline(time.Now().Add(wsReadIdleTimeout))
 	_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 
 	if !reused {
@@ -709,6 +722,13 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 			// caused false timeout errors at ~2-3 minutes when the proxy
 			// had brief network pauses.
 			_, msg, err := conn.ReadMessage()
+			if err == nil {
+				// Refresh read deadline after every successful frame.
+				// This turns the initial deadline into a sliding idle timeout:
+				// a slow-but-active upstream (long reasoning, proxy pauses)
+				// keeps the connection alive as long as frames keep coming.
+				_ = conn.SetReadDeadline(time.Now().Add(wsReadIdleTimeout))
+			}
 			select {
 			case readCh <- wsRead{msg: msg, err: err}:
 			case <-done:
@@ -1174,6 +1194,19 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 	// the client: the SSE stream stays open and deltas keep flowing.
 	streamedText := streamed.String()
 	if streamedText != "" && depth < maxAutoContinue {
+		// Only auto-continue on DeadlineExceeded (server hit internal deadline),
+		// NOT on Canceled (client went away — continuing is pointless).
+		if errors.Is(ctx.Err(), context.Canceled) {
+			log.Printf("[chathub] client canceled with %d bytes streamed; returning partial result (depth=%d)", len(streamedText), depth)
+			returnConn = false
+			return Result{
+				Text:       streamedText,
+				Reasoning:  reasoningBuf.String(),
+				Events:     events,
+				Normalized: NormalizeEvents(events),
+				Timestamps: ts,
+			}, nil
+		}
 		log.Printf("[chathub] deadline exceeded with %d bytes streamed; attempting auto-continue (depth=%d)", len(streamedText), depth)
 		returnConn = false
 		// Build a continue request reusing the same conversation/session.
@@ -1182,25 +1215,48 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 		continueReq.Started = false
 		continueReq.ConversationID = req.ConversationID
 		continueReq.SessionID = req.SessionID
-		// Create a fresh context for the continue request so it gets a
-		// full deadline, not the remains of the parent's exhausted one.
-		// But inherit client cancellation: if the client went away
-		// (ctx.Canceled), abort the continue instead of burning a full
-		// 10-minute cycle against an account the user will never see.
-		continueBase, continueBaseCancel := context.WithCancel(context.Background())
-		defer continueBaseCancel()
+		// Continue must respect the SAME deadline as the original request.
+		// Previously this created a fresh 10-minute context, causing auto-continue
+		// to burn through the entire account budget even after the client's HTTP
+		// context had expired. Now we inherit the remaining budget from ctx and
+		// cap it at maxContinueTimeout to bound tail latency.
+		var continueCtx context.Context
+		var continueCancel context.CancelFunc
+		if dl, ok := ctx.Deadline(); ok {
+			// Use remaining time, capped at maxContinueTimeout.
+			remaining := time.Until(dl)
+			if remaining <= 0 {
+				log.Printf("[chathub] original deadline already expired; returning partial result (depth=%d)", depth)
+				returnConn = false
+				return Result{
+					Text:       streamedText,
+					Reasoning:  reasoningBuf.String(),
+					Events:     events,
+					Normalized: NormalizeEvents(events),
+					Timestamps: ts,
+				}, nil
+			}
+			if remaining > maxContinueTimeout {
+				remaining = maxContinueTimeout
+			}
+			continueCtx, continueCancel = context.WithTimeout(context.Background(), remaining)
+		} else {
+			// No deadline on original ctx — apply a bounded default.
+			continueCtx, continueCancel = context.WithTimeout(context.Background(), maxContinueTimeout)
+		}
+		// Propagate client cancellation: if the client goes away mid-continue, stop.
+		continueCtx, continueCancel = context.WithCancel(continueCtx)
+		defer continueCancel()
 		go func() {
 			select {
 			case <-ctx.Done():
 				if ctx.Err() == context.Canceled {
-					continueBaseCancel()
+					continueCancel()
 				}
-			case <-continueBase.Done():
+			case <-continueCtx.Done():
 			}
 		}()
-		continueCtx, continueCancel := context.WithTimeout(continueBase, 10*time.Minute)
-		defer continueCancel()
-		// The second call gets its own deadline; onDelta is the same
+		// The second call inherits the bounded deadline; onDelta is the same
 		// callback so streamed content flows to the client seamlessly.
 		continueResult, continueErr := c.chatWithHandlersDepth(continueCtx, acc, continueReq, onDelta, onEvent, depth+1)
 		if continueErr == nil && continueResult.Text != "" {
