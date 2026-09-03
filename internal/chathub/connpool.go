@@ -13,12 +13,19 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// disableWSPool is set via M365_DISABLE_WS_POOL=1 to bypass connection pooling.
-// Pooling ignores the per-request wsURL (which carries sessionID, conversationID,
-// requestID, and access_token), so a warmed connection can be reused by a request
-// bound to a different session — causing empty completions, 502s, or silent
-// conversation routing errors. Disable it for A/B verification.
-var disableWSPool = os.Getenv("M365_DISABLE_WS_POOL") == "1"
+// wsPoolEnabled reports whether WebSocket connection pooling is active.
+// Pooling is DISABLED by default: it ignores the per-request wsURL (which
+// carries sessionID, conversationID, requestID, and access_token), so a
+// warmed connection can be reused by a request bound to a different session
+// — causing empty completions, 502s, or silent conversation routing errors.
+// Set M365_ENABLE_WS_POOL=1 to opt back in; M365_DISABLE_WS_POOL=1 remains
+// as an explicit force-disable override.
+func wsPoolEnabled() bool {
+	if os.Getenv("M365_DISABLE_WS_POOL") == "1" {
+		return false
+	}
+	return os.Getenv("M365_ENABLE_WS_POOL") == "1"
+}
 
 type pooledConn struct {
 	conn      *websocket.Conn
@@ -50,8 +57,8 @@ func NewConnPool(dialer *websocket.Dialer, header http.Header) *ConnPool {
 		header: header,
 		stop:   make(chan struct{}),
 	}
-	if disableWSPool {
-		log.Printf("[connpool] WebSocket connection pooling DISABLED (M365_DISABLE_WS_POOL=1)")
+	if !wsPoolEnabled() {
+		log.Printf("[connpool] WebSocket connection pooling DISABLED (enable with M365_ENABLE_WS_POOL=1)")
 		return p
 	}
 	go p.gcLoop()
@@ -115,7 +122,7 @@ func (p *ConnPool) evict(key string, target *pooledConn) {
 
 func (p *ConnPool) Take(ctx context.Context, oid, tid string, wsURL string) (*websocket.Conn, *sync.Mutex, <-chan []byte, <-chan error, bool, error) {
 	_ = wsURL
-	if disableWSPool {
+	if !wsPoolEnabled() {
 		conn, resp, err := p.dialer.DialContext(ctx, wsURL, p.header.Clone())
 		if err != nil {
 			if resp != nil {
@@ -171,7 +178,7 @@ func (p *ConnPool) Take(ctx context.Context, oid, tid string, wsURL string) (*we
 }
 
 func (p *ConnPool) Warm(ctx context.Context, acc Account, wsURL string) {
-	if wsURL == "" || disableWSPool {
+	if wsURL == "" || !wsPoolEnabled() {
 		return
 	}
 	key := p.key(acc.OID, acc.TID)

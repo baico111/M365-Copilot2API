@@ -493,8 +493,16 @@ sudo firewall-cmd --reload
 | `M365_MAX_TOOL_ROUNDS` | `16` | 单次请求最大工具轮次 |
 | `M365_CONTEXT_WINDOW` | `128000` | 上下文窗口 |
 | `M365_MAX_OUTPUT_TOKENS` | `16384` | 最大输出 Token |
-| `M365_CHAT_TIMEOUT_SECONDS` | `120` | 聊天超时（秒） |
+| `M365_CHAT_TIMEOUT_SECONDS` | `600` | 聊天超时（秒） |
 | `M365_IMAGE_TIMEOUT_SECONDS` | `150` | 图片处理超时（秒） |
+
+### 网络稳定性与超时
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `M365_WS_IDLE_TIMEOUT_SECONDS` | `180` | ChatHub WebSocket 帧间空闲超时（秒）。每次收到帧都会刷新，仅当上游停顿超过该值才判定连接死亡。走 SOCKS5 代理/长推理时帧间隔可能拉长，设太短（60s/120s）会导致中途断流、回复被截断。 |
+| `M365_ENABLE_WS_POOL` | 关闭 | 是否启用 WebSocket 连接池复用。默认关闭：池化连接会忽略请求自带的 session/conversation 参数，可能被其它会话复用，造成空补全 / 502 / 会话串号。仅当确认无多会话并发时再开启。 |
+| `M365_DISABLE_WS_POOL` | — | 兼容旧开关：设为 `1` 强制关闭连接池（优先生效，覆盖 `M365_ENABLE_WS_POOL`）。 |
 
 ### 代理池与认证
 

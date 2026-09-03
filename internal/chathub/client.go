@@ -167,12 +167,26 @@ const (
 	// base64-encoded and held in memory alongside the multipart body.
 	maxAttachments   = 10
 	maxAttachmentMiB = 10
-	// wsReadIdleTimeout is the idle timeout between WebSocket frames. It is
-	// refreshed after every successful read so a slow-but-active upstream
-	// (long reasoning, streaming tool calls) is not killed. Must be long
-	// enough to accommodate the longest expected gap between upstream frames.
-	wsReadIdleTimeout = 60 * time.Second
 )
+
+// wsReadIdleTimeout is the idle timeout between WebSocket frames. It is
+// refreshed after every successful read so a slow-but-active upstream
+// (long reasoning, streaming tool calls) is not killed. Must be long enough
+// to accommodate the longest expected gap between upstream frames. When
+// routing through SOCKS5 proxies (sing-box) the chain adds latency and may
+// pause during long reasoning, so the default is 180s — 60s caused false
+// mid-stream timeouts and truncated responses. Override per second with
+// M365_WS_IDLE_TIMEOUT_SECONDS.
+var wsReadIdleTimeout = wsReadIdleTimeoutFromEnv()
+
+func wsReadIdleTimeoutFromEnv() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("M365_WS_IDLE_TIMEOUT_SECONDS")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 30 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 180 * time.Second
+}
 
 // Variants mirrored from the verified browser / Python probe.
 const variants = "EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,feature.cwcallowedos,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix,feature.EnableImageGenInsufficientTokensThrottled,feature.EnableImageGenSystemCapacityThrottled,feature.EnableConversationShareApis,feature.IsCitationsReferencesOutputEnabled,feature.enableDeltaStreamingForReferences,feature.enableIncludeReferencesInDeltaResponse,feature.enablereferencesforagents,feature.EnableMergingPureDeltas,feature.EnableRemoveStreamingMode,feature.EnableCodeInterpreterConversion,agt_module_attr_enableReferencesForCodeInterpreter,agt_module_enableCodeInterpreterHallucinatedUrlFilter,SingletonEnvOn,cdxenablefccinmainline,EnableComposeWidget,feature.EnableContentApiandDocTypeHtmlInRichAnswers,cdxgrounding_api_v2_rich_web_answers_reference_bottom_force,cdxenablerenderforisocomp,feature.EnableSkipRehydrationForSpeCIdImages,feature.EnablePersonalization,feature.EnableBase64DataInMessageAnnotations,feature.EnableSkipEmittingMessageOnFlush,feature.EnableRemoveEmptySourceAttributions,agt_researcheragent_enableMemoryRead"
@@ -359,13 +373,15 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 }
 
 // maxAutoContinue limits how many times we auto-continue an incomplete
-// response. Set to 1: one continuation attempt is enough for most truncated
-// responses, and multiple attempts increase the risk of duplicate content.
-const maxAutoContinue = 1
+// response. Each hop gets its own bounded window (maxContinueTimeout), so a
+// genuinely long answer is allowed a couple of continuation attempts before
+// we give up and return the partial text as-is.
+const maxAutoContinue = 2
 
-// maxContinueTimeout bounds how long an auto-continue can run. It inherits
-// the original request's remaining deadline but never exceeds this cap, so
-// a 5-minute client timeout does not trigger a 10-minute continuation burn.
+// maxContinueTimeout bounds how long a single auto-continue hop can run.
+// The continuation runs on its own fresh clock (not the original request's
+// near-exhausted deadline) so the upstream gets real time to finish, but the
+// cap prevents a pathological case from burning unbounded upstream budget.
 const maxContinueTimeout = 2 * time.Minute
 
 // chatDeadlineFromCtx derives the internal deadline from the context's
@@ -715,12 +731,12 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 				}
 				continue
 			}
-			// 180s per-frame read deadline: when routing through SOCKS5
-			// proxies (sing-box), the proxy chain adds latency and may
-			// pause during long reasoning. 180s gives ample room while
-			// still catching truly dead connections. The previous 120s
-			// caused false timeout errors at ~2-3 minutes when the proxy
-			// had brief network pauses.
+			// Sliding read deadline (wsReadIdleTimeout, default 180s): when
+			// routing through SOCKS5 proxies (sing-box), the proxy chain adds
+			// latency and may pause during long reasoning. 180s gives ample
+			// room while still catching truly dead connections; shorter
+			// windows (60s/120s) caused false timeout errors and truncated
+			// responses when the proxy had brief network pauses.
 			_, msg, err := conn.ReadMessage()
 			if err == nil {
 				// Refresh read deadline after every successful frame.
@@ -1215,49 +1231,30 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 		continueReq.Started = false
 		continueReq.ConversationID = req.ConversationID
 		continueReq.SessionID = req.SessionID
-		// Continue must respect the SAME deadline as the original request.
-		// Previously this created a fresh 10-minute context, causing auto-continue
-		// to burn through the entire account budget even after the client's HTTP
-		// context had expired. Now we inherit the remaining budget from ctx and
-		// cap it at maxContinueTimeout to bound tail latency.
-		var continueCtx context.Context
-		var continueCancel context.CancelFunc
-		if dl, ok := ctx.Deadline(); ok {
-			// Use remaining time, capped at maxContinueTimeout.
-			remaining := time.Until(dl)
-			if remaining <= 0 {
-				log.Printf("[chathub] original deadline already expired; returning partial result (depth=%d)", depth)
-				returnConn = false
-				return Result{
-					Text:       streamedText,
-					Reasoning:  reasoningBuf.String(),
-					Events:     events,
-					Normalized: NormalizeEvents(events),
-					Timestamps: ts,
-				}, nil
-			}
-			if remaining > maxContinueTimeout {
-				remaining = maxContinueTimeout
-			}
-			continueCtx, continueCancel = context.WithTimeout(context.Background(), remaining)
-		} else {
-			// No deadline on original ctx — apply a bounded default.
-			continueCtx, continueCancel = context.WithTimeout(context.Background(), maxContinueTimeout)
-		}
-		// Propagate client cancellation: if the client goes away mid-continue, stop.
-		continueCtx, continueCancel = context.WithCancel(continueCtx)
+		// The auto-continue runs on its own fresh budget (maxContinueTimeout)
+		// rather than inheriting the original ctx's remaining time. The read
+		// loop deadline is ctx.Deadline()-10s, so by the time we reach here the
+		// original context typically has ~10s left — inheriting it left the
+		// continuation no time to finish and the answer stayed truncated.
+		// Bounding each hop at maxContinueTimeout still caps tail latency.
+		// Client cancellation propagates below, so a client disconnect stops
+		// the continue instead of burning upstream budget.
+		continueCtx, continueCancel := context.WithTimeout(context.Background(), maxContinueTimeout)
 		defer continueCancel()
 		go func() {
 			select {
 			case <-ctx.Done():
+				// Only Canceled means the client went away mid-continue → stop.
+				// A plain DeadlineExceeded is ignored: the HTTP client may still
+				// be receiving SSE deltas, so let the answer finish.
 				if ctx.Err() == context.Canceled {
 					continueCancel()
 				}
 			case <-continueCtx.Done():
 			}
 		}()
-		// The second call inherits the bounded deadline; onDelta is the same
-		// callback so streamed content flows to the client seamlessly.
+		// The recursive call runs under its own bounded deadline; onDelta is the
+		// same callback so streamed content flows to the client seamlessly.
 		continueResult, continueErr := c.chatWithHandlersDepth(continueCtx, acc, continueReq, onDelta, onEvent, depth+1)
 		if continueErr == nil && continueResult.Text != "" {
 			// Combine: original streamed text + continuation text.
