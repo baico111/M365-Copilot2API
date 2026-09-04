@@ -1552,8 +1552,10 @@ async function loadProxies(){
   }catch(e){$('proxyStatus').innerHTML='<div class="empty" style="text-align:center;padding:24px;color:var(--danger)">'+esc(e.message)+'</div>';}
 }
 async function proxyAdd(){
-  const raw=$('proxyInput').value.trim();
+  let raw=$('proxyInput').value.trim();
   if(!raw)return showNotice('请输入订阅地址','error');
+  if(!/^https?:\/\/.+/i.test(raw))return showNotice('订阅地址必须以 http:// 或 https:// 开头','error');
+  if(/^https?:\/\/localhost|^https?:\/\/127\.|^https?:\/\/0\.|^https?:\/\/169\.254|^https?:\/\/10\.|^https?:\/\/192\.168|^https?:\/\/172\.(1[6-9]|2\d|3[01])\./i.test(raw))return showNotice('出于 SSRF 防护不允许指向本机/内网地址的订阅 URL','error');
   try{
     showNotice('正在拉取订阅并启动 sing-box...','info');
     const d=await api('/api/admin/proxy-pool',{method:'POST',body:JSON.stringify({subscription:raw})});
@@ -1629,8 +1631,12 @@ async function saveSettings(){
     const body={};
     if(listen)body.listenAddress=listen;
     if(timeout)body.chatTimeoutSeconds=parseInt(timeout);
-    await api('/api/admin/settings',{method:'PUT',body:JSON.stringify(body)});
+    const d=await api('/api/admin/settings',{method:'PUT',body:JSON.stringify(body)});
     showNotice('设置已保存','success');
+    // restartRequiredFields: listenAddress changes only apply after a restart; tell the operator.
+    if(listen && d&&d.restartRequiredFields&&d.restartRequiredFields.includes('listenAddress')){
+      showNotice('监听地址将在服务重启后生效','info');
+    }
   }catch(e){showNotice(e.message,'error');}
 }
 
@@ -1665,15 +1671,13 @@ async function accountRestoreImport(){
     const fd=new FormData();
     fd.append('file',fileInput.files[0]);
     fd.append('password',pwd);
-    const resp=await fetch('/api/accounts/restore',{method:'POST',,body:fd});
+    const resp=await fetch('/api/accounts/restore',{method:'POST',body:fd});
     const d=await resp.json();
     if(!resp.ok)throw new Error(d.error?.message||'restore failed');
     showNotice('恢复成功，导入 '+d.imported+' 个账号','success');
     $('restorePassword').value='';fileInput.value='';
     loadAccounts();
   }catch(e){showNotice(e.message,'error');}
-}
-:{};
 }
 
 // Init

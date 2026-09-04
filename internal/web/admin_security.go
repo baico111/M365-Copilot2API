@@ -291,11 +291,13 @@ func auditLog(r *http.Request, event, detail string) {
 
 func clientIP(r *http.Request) string {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	// XFF is attacker-supplied unless a reverse proxy is proven to be in
-	// front of us. Auto-trusting any loopback peer lets a direct client
-	// rotate the header to defeat per-IP login lockout and forge audit IPs.
-	// Require an explicit deployment opt-in before consulting XFF.
-	if os.Getenv("M365_TRUST_PROXY") == "1" && host != "" {
+	// Loopback REMOTE ADDR is the normal shape of the standard deployment
+	// (nginx/caddy on the same box), so XFF is honored for it by default;
+	// requiring an opt-in made every real client share one 127.0.0.1 login
+	// failure bucket (five failures from any client locked EVERYONE out).
+	// Set M365_TRUST_PROXY=0 to disable XFF entirely on hosts where local
+	// processes are untrusted.
+	if os.Getenv("M365_TRUST_PROXY") != "0" && host != "" {
 		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 			parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
 			for i := len(parts) - 1; i >= 0; i-- {

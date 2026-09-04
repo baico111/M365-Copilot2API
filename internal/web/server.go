@@ -367,6 +367,11 @@ func (s *Server) RefreshExpiredTokens() {
 func (s *Server) Routes() http.Handler {
 	mcp.APIKeyValidator = s.validAPIKey
 	m := http.NewServeMux()
+	// Browsers always fetch this; answering 404-JSON via auth middleware only
+	// floods the console. Silence it before the admin gate.
+	m.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
 	m.HandleFunc("/api/admin/login", s.adminLogin)
 	m.HandleFunc("/api/admin/logout", s.adminLogout)
 	m.HandleFunc("/api/admin/session", s.adminSession)
@@ -440,7 +445,7 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/api/auth/start" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/callback" || r.URL.Path == "/api/health" || r.URL.Path == "/api/version" || r.URL.Path == "/" || r.URL.Path == "/login" {
+		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/api/auth/start" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/callback" || r.URL.Path == "/api/health" || r.URL.Path == "/api/version" || r.URL.Path == "/favicon.ico" || r.URL.Path == "/" || r.URL.Path == "/login" {
 			next.ServeHTTP(w, r)
 			return
 		}
