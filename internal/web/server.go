@@ -176,6 +176,7 @@ type Server struct {
 	usage                *usageLog
 	generatedImages      map[string]generatedImage
 	convCache            *conversationCache
+	convGate             *conversationGate
 	lastHealthyAccount   string
 }
 
@@ -291,6 +292,7 @@ func New() (*Server, error) {
 		usage:                openUsageLog(),
 		generatedImages:      map[string]generatedImage{},
 		convCache:            newConversationCache(),
+		convGate:             newConversationGate(),
 	}, nil
 }
 
@@ -1248,8 +1250,9 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 		// different accounts (and thus different exit IPs) are used.
 		seen := make(map[string]bool)
 		var firstUnavailable string
-		tokenFailures := 0 // accounts that were healthy+unfull but failed EnsureValid
-		probedHealthy := 0 // accounts that reached the EnsureValid step
+		tokenFailures := 0      // healthy+unfull accounts whose EnsureValid failed
+		probedHealthy := 0      // accounts that reached the EnsureValid step
+		concurrencySkipped := 0 // healthy accounts skipped for a full slot
 		for i := 0; i < 256; i++ {
 			acc, ok := s.tokens.Next()
 			if !ok {
@@ -1270,6 +1273,7 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 				continue
 			}
 			if !s.accountConcurrency.Available(accountID) {
+				concurrencySkipped++
 				continue // concurrency full, try next
 			}
 			// Found a healthy account with capacity
@@ -1295,13 +1299,54 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 			}
 			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are cooling down; try again later"}
 		}
-		if tokenFailures > 0 && tokenFailures == probedHealthy {
+		// "token broken" is only the real story when nothing was merely
+		// concurrency-saturated; otherwise this is recoverable pressure and
+		// must stay a short-retry 429, not a re-authorize-forever 401.
+		if tokenFailures > 0 && tokenFailures == probedHealthy && concurrencySkipped == 0 {
 			return auth.AccountToken{}, &UpstreamHTTPError{Status: 401, RetryAfter: 300, Body: "no account has a valid token; re-authorize accounts"}
 		}
 		return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: 1, Body: "all accounts are at their concurrency limit; try again shortly"}
 	}
 	result, err := s.tokens.EnsureValid(accountID)
 	return result, err
+}
+
+// nextHealthyAccountDifferentFrom returns a healthy account with a valid
+// token for the conversation-gate fallback. It behaves like the auto route of
+// resolveAccount but additionally excludes the conversation owner (so the two
+// tools land on genuinely separate upstream users) and, unlike resolveAccount,
+// reports "no other account" instead of a 429 — callers must then keep the
+// current account rather than fail.
+func (s *Server) nextHealthyAccountDifferentFrom(exceptID string) (auth.AccountToken, bool) {
+	seen := make(map[string]bool)
+	for i := 0; i < 256; i++ {
+		acc, ok := s.tokens.Next()
+		if !ok {
+			break
+		}
+		if seen[acc.ID] || acc.ID == exceptID {
+			continue
+		}
+		seen[acc.ID] = true
+		if !s.accountAvailable(acc.ID) {
+			continue
+		}
+		valid, err := s.tokens.EnsureValid(acc.ID)
+		if err != nil {
+			continue
+		}
+		if valid.OID == "" || valid.TID == "" {
+			o, t := extractOIDTID(valid.AccessToken)
+			if o != "" {
+				valid.OID, valid.TID = o, t
+			}
+		}
+		if valid.OID == "" || valid.TID == "" {
+			continue
+		}
+		return valid, true
+	}
+	return auth.AccountToken{}, false
 }
 
 // nextHealthyAccount returns the next round-robin account that is still
@@ -1332,6 +1377,17 @@ func (s *Server) nextHealthyAccount(avoidID string) (auth.AccountToken, error) {
 			continue
 		}
 		if token, err := s.tokens.EnsureValid(acc.ID); err == nil {
+			if token.OID == "" || token.TID == "" {
+				if o, t := extractOIDTID(token.AccessToken); o != "" {
+					token.OID, token.TID = o, t
+				}
+			}
+			// Failing over to an account without OID/TID is guaranteed to
+			// error upstream ("account missing oid/tid") and would then be
+			// wrongly cooled down for it; skip it and keep searching.
+			if token.OID == "" || token.TID == "" {
+				continue
+			}
 			return token, nil
 		}
 	}
@@ -1364,6 +1420,17 @@ func (s *Server) nextHealthyAccountMulti(tried map[string]bool) (auth.AccountTok
 			continue
 		}
 		if token, err := s.tokens.EnsureValid(acc.ID); err == nil {
+			if token.OID == "" || token.TID == "" {
+				if o, t := extractOIDTID(token.AccessToken); o != "" {
+					token.OID, token.TID = o, t
+				}
+			}
+			// Failing over to an account without OID/TID is guaranteed to
+			// error upstream ("account missing oid/tid") and would then be
+			// wrongly cooled down for it; skip it and keep searching.
+			if token.OID == "" || token.TID == "" {
+				continue
+			}
 			return token, nil
 		}
 	}
@@ -1459,6 +1526,13 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "message or attachment required")
 		return
 	}
+	// /api/chat is the console's plain-text endpoint and never honored
+	// tools/reasoning/response_format; reject loudly instead of silently
+	// discarding them (the caller otherwise gets a confident wrong answer).
+	if len(body.Tools) > 0 || len(body.Functions) > 0 || body.ToolChoice != nil || body.FunctionCall != nil || body.Reasoning != nil || strings.TrimSpace(body.ReasoningEffort) != "" || body.ResponseFormat != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "tools/reasoning/response_format are not supported on /api/chat; use /v1/chat/completions")
+		return
+	}
 	if body.SessionKey != "" {
 		if v, ok := s.sessions.get(sessionScope(r, body.SessionKey)); ok {
 			body.AccountID = firstNonEmpty(body.AccountID, v.AccountID)
@@ -1484,6 +1558,25 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()
+	// A cloud conversation is a strictly sequential ChatHub resource. When
+	// several tools hammer one model concurrently, the session-key/user/
+	// content-key/conv-cache reuse paths can all hand the SAME conversation
+	// to more than one in-flight request, and racing posts interleave on the
+	// upstream thread (queued turns, cross-answered prompts, corrupted
+	// history). Briefly wait for the in-flight turn; if it stays busy,
+	// gracefully drop the reuse (fresh conversation, full prompt) instead of
+	// corrupting it.
+	releaseConv := func() {}
+	if body.ConversationID != "" {
+		var convOK bool
+		releaseConv, convOK = s.convGate.acquire(ctx, acc.ID+"|"+body.ConversationID, 4*time.Second)
+		if !convOK {
+			log.Printf("[conv-gate] conversation busy, reusing a fresh conversation instead: account=%s conversation=%s", acc.ID, body.ConversationID)
+			body.ConversationID = ""
+			body.SessionID = ""
+		}
+	}
+	defer releaseConv()
 	chatSettings := s.settings.get()
 	servingAccountID := acc.ID
 	opts := []chatCallOption{withServingAccount(&servingAccountID)}
@@ -1893,7 +1986,11 @@ func buildAnswerRequest(answerPrompt, tone string, body oaiReq, ledger agentLedg
 			}
 			mcpTools = append(mcpTools, mcp.Tool{Name: f.Name, Description: f.Description, InputSchema: schema})
 		}
-		if len(mcpTools) > 0 {
+		// Only advertise tools to the global MCP registry when an MCP SSE
+		// endpoint actually exists for this request; the unconditional merge
+		// let any API-key holder grow a process-wide, never-evicted,
+		// cross-tenant-visible registry with arbitrary names/schemas.
+		if len(mcpTools) > 0 && mcpServerURL != "" {
 			mcp.GlobalToolRegistry.MergeTools(mcpTools)
 		}
 	}
@@ -1938,6 +2035,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	normalizeLegacyTools(&body)
 	body.ConversationID = firstNonEmpty(body.ConversationID, body.ConversationIDC)
+	// Record this BEFORE the reuse paths below inject an AccountID: the
+	// conversation-gate fallback only re-routes to a different account when
+	// the *client* did not pin one.
+	clientPinned := body.AccountID != ""
 	body.SessionID = firstNonEmpty(body.SessionID, body.SessionIDC)
 	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), len(raw))
 	if err := validateToolConversation(body.Messages); err != nil {
@@ -1974,6 +2075,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	// single message.text field. This keeps system/developer instructions,
 	// history, and the current user turn distinguishable.
 	var prompt string
+	origAttachments := body.Attachments
 	prompt, body.Attachments = flattenPromptMessages(body.Messages, body.Attachments)
 	log.Printf("[req-trace] id=%s stage=prompt_flattened prompt_len=%d attachments=%d", requestID, len(prompt), len(body.Attachments))
 	fmt.Printf("[multimodal-entry] messages=%d attachments=%d prompt_len=%d\n", len(body.Messages), len(body.Attachments), len(prompt))
@@ -2025,6 +2127,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	}
 	answerPrompt := prompt
 	resolvedConversationID := ""
+	explicitHistoryRewritten := false
 	if body.ConversationID == "" && len(body.Messages) > 0 && (body.Metadata == nil || !body.Metadata.CopilotTempSession) {
 		resolved := s.sessionResolver.Resolve(r, &body)
 		if !resolved.IsNew {
@@ -2032,6 +2135,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			body.ConversationID = resolved.ConversationID
 			body.SessionID = resolved.SessionID
 			body.AccountID = firstNonEmpty(body.AccountID, resolved.AccountID)
+			// explicit_reset: the client kept the same X-M365-Session-Id but
+			// rewrote history (auto-compact). Account stays pinned; the old
+			// cloud conversation is abandoned in favour of a fresh one. Make
+			// sure conv-cache cannot immediately hand back that same stale
+			// thread via the message-count heuristic.
+			if resolved.MatchedBy == "explicit_reset" {
+				explicitHistoryRewritten = true
+			}
 			log.Printf("[session-resolver] matched=%s conversation=%s history=%d total=%d", resolved.MatchedBy, resolved.ConversationID, resolved.HistoryLen, len(body.Messages))
 			if resolved.HistoryLen > 0 && resolved.HistoryLen < len(body.Messages) {
 				incPrompt, incAtt := flattenPromptMessages(body.Messages[resolved.HistoryLen:], nil)
@@ -2068,7 +2179,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	convReused := false
 	convCacheModel := firstNonEmpty(body.Model, "m365-copilot")
 	convCacheSessionKey := convSessionKey(r, &body)
-	if body.ConversationID == "" && len(body.Messages) > 1 &&
+	if explicitHistoryRewritten {
+		s.invalidateConvCache(convCacheSessionKey, acc.ID, convCacheModel)
+	}
+	if body.ConversationID == "" && !explicitHistoryRewritten && len(body.Messages) > 1 &&
 		(body.Metadata == nil || !body.Metadata.CopilotTempSession) {
 		sysHash := systemPromptHash(body.Messages)
 		if cached := s.convCache.Lookup(convCacheSessionKey, acc.ID, convCacheModel); cached != nil && cached.SystemPrompt == sysHash {
@@ -2122,6 +2236,39 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()
+	// A cloud conversation is a strictly sequential ChatHub resource. When
+	// several tools hammer one model concurrently, the session-key/user/
+	// content-key/conv-cache reuse paths can all hand the SAME conversation
+	// to more than one in-flight request, and racing posts interleave on the
+	// upstream thread (queued turns, cross-answered prompts, corrupted
+	// history). Briefly wait for the in-flight turn; if it stays busy,
+	// gracefully drop the reuse (fresh conversation, full prompt) instead of
+	// corrupting it. A degraded conversation is brand new, so when the client
+	// did not pin an account we move it to a DIFFERENT healthy account: two
+	// tools then run on separate upstream users entirely (separate quota,
+	// throttling, proxy exit), instead of competing on one. With a single
+	// account configured this degrades to the previous behavior unchanged.
+	releaseConv := func() {}
+	if body.ConversationID != "" {
+		var convOK bool
+		releaseConv, convOK = s.convGate.acquire(ctx, acc.ID+"|"+body.ConversationID, 4*time.Second)
+		if !convOK {
+			log.Printf("[conv-gate] conversation busy, starting a fresh conversation instead: account=%s conversation=%s", acc.ID, body.ConversationID)
+			body.ConversationID = ""
+			body.SessionID = ""
+			convReused = false
+			answerPrompt = prompt
+			body.Attachments = origAttachments
+			if !clientPinned {
+				body.AccountID = ""
+				if alt, ok := s.nextHealthyAccountDifferentFrom(acc.ID); ok {
+					log.Printf("[conv-gate] fresh conversation re-routed account %s -> %s", acc.ID, alt.ID)
+					acc = alt
+				}
+			}
+		}
+	}
+	defer releaseConv()
 	account := chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}
 	localeInfo := parseLocaleFromHeaders(r)
 	// The stream is opened by the actual response path below. Do not emit a
@@ -2255,6 +2402,27 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 			return nil
+		}
+		// flushText drains the identity filter's buffer WITHOUT re-entering
+		// Push: the filter intentionally holds back trailing text that has no
+		// sentence boundary, so without a final flush the last segment of
+		// every answer ending without punctuation was silently dropped from
+		// the stream (reply truncation visible to clients).
+		flushText := func() {
+			tail := identityFilter.Flush()
+			if tail == "" {
+				return
+			}
+			if err := r.Context().Err(); err != nil {
+				return
+			}
+			delta := map[string]any{"content": tail}
+			if first {
+				delta["role"] = "assistant"
+				first = false
+			}
+			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}}
+			_ = sw.data(mustJSON(chunk))
 		}
 		servingAccountID := acc.ID
 		opts := []chatCallOption{withServingAccount(&servingAccountID)}
@@ -2423,6 +2591,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				if pending.Len() > 0 {
 					_ = emitText(pending.String())
 				}
+				flushText()
 				finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
 				_ = sw.data(mustJSON(finishChunk))
 				_ = sw.data("[DONE]")
@@ -2520,6 +2689,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
 				calls = calls[:1]
 			}
+			flushText()
 			_ = writeToolResponse(w, id, model, true, body.shouldSendStreamUsage(), calls, toolResult)
 			if body.User != "" && res.ConversationID != "" {
 				s.userSessions.Put(tenantFromRequest(r), body.User, res.ConversationID, res.SessionID, acc.ID)
@@ -2532,6 +2702,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
 			return
 		}
+		flushText()
 		finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
 		if res.Throttling != nil {
 			finishChunk["x_m365_throttling"] = res.Throttling

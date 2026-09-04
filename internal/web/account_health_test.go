@@ -140,9 +140,9 @@ func testAccountFiles(t *testing.T) *auth.Store {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "accounts.json")
 	toks := map[string]auth.TokenSet{
-		"u-1": {HomeOID: "u-1", Email: "one@example.com", AccessToken: "tok1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)},
-		"u-2": {HomeOID: "u-2", Email: "two@example.com", AccessToken: "tok2", RefreshToken: "r2", ExpiresAt: time.Now().Add(time.Hour)},
-		"u-3": {HomeOID: "u-3", Email: "three@example.com", AccessToken: "tok3", RefreshToken: "r3", ExpiresAt: time.Now().Add(time.Hour)},
+		"u-1": {HomeOID: "u-1", TenantID: "t-1", Email: "one@example.com", AccessToken: "tok1", RefreshToken: "r1", ExpiresAt: time.Now().Add(time.Hour)},
+		"u-2": {HomeOID: "u-2", TenantID: "t-2", Email: "two@example.com", AccessToken: "tok2", RefreshToken: "r2", ExpiresAt: time.Now().Add(time.Hour)},
+		"u-3": {HomeOID: "u-3", TenantID: "t-3", Email: "three@example.com", AccessToken: "tok3", RefreshToken: "r3", ExpiresAt: time.Now().Add(time.Hour)},
 	}
 	b, _ := os.ReadFile(path)
 	_ = b

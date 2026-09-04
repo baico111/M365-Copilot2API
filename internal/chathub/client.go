@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -384,6 +385,91 @@ const maxAutoContinue = 2
 // cap prevents a pathological case from burning unbounded upstream budget.
 const maxContinueTimeout = 2 * time.Minute
 
+// Transparent continuation for *completed* answers that look length-truncated.
+//
+// When the Copilot backend cuts an answer at the per-turn output cap, it still
+// sends the normal type-2/type-3 completion frames: there is no truncation
+// marker in the protocol (verified against 12 HAR session captures). The
+// deadline-based auto-continue above never sees this case because the stream
+// completed "normally". The heuristic below re-asks the model in the same
+// conversation once (sharing the maxAutoContinue budget) when the finished
+// text is long AND ends mid-sentence, and only adopts the continuation when it
+// is substantive (>= continueAdoptMinChars) or itself looks cut — so a model
+// replying "the answer above is complete" with a short note leaves the
+// original untouched. Disable with M365_CONTINUATION_ON_COMPLETE=0; tune the
+// length floor with M365_CONTINUATION_MIN_CHARS.
+var (
+	continueOnComplete    = envFlag("M365_CONTINUATION_ON_COMPLETE", true)
+	continueMinChars      = envIntAtLeast("M365_CONTINUATION_MIN_CHARS", 3000, 200)
+	continueAdoptMinChars = 240
+)
+
+func envFlag(name string, def bool) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	switch strings.ToLower(raw) {
+	case "0", "false", "no", "off":
+		return false
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return def
+}
+
+func envIntAtLeast(name string, def, min int) int {
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name))); err == nil && n >= min {
+		return n
+	}
+	return def
+}
+
+var continueTerminalRunes = map[rune]bool{
+	'.': true, '。': true, '!': true, '！': true, '?': true, '？': true,
+	'”': true, '"': true, '」': true, '』': true, '）': true, ')': true,
+	']': true, '】': true, '}': true, '>': true, '`': true, '…': true,
+	':': true, '：': true, ';': true, '；': true, '|': true, '*': true,
+	'#': true, '~': true, '～': true,
+}
+
+// looksLengthTruncated reports whether a completed answer was likely cut at the
+// model's per-turn output cap: long, not fenced-close ended, and the last
+// visible word-like character implies the sentence never ended.
+func looksLengthTruncated(text string) bool {
+	if len(text) < continueMinChars {
+		return false
+	}
+	t := strings.TrimRight(text, " \t\r\n")
+	if t == "" {
+		return false
+	}
+	if strings.HasSuffix(t, "```") {
+		return false
+	}
+	runes := []rune(t)
+	last := runes[len(runes)-1]
+	if continueTerminalRunes[last] {
+		return false
+	}
+	if last == ',' || last == '，' || last == '-' || last == '、' {
+		return true
+	}
+	return unicode.IsLetter(last) || unicode.IsDigit(last)
+}
+
+// adoptContinuation decides whether the follow-up hop's text should be
+// appended. A short continuation that does not itself look truncated is the
+// model's closing sentence for an already-complete answer, not missing
+// content, so it is dropped.
+func adoptContinuation(cont string) bool {
+	c := strings.TrimSpace(cont)
+	if c == "" {
+		return false
+	}
+	return len(c) >= continueAdoptMinChars || looksLengthTruncated(c)
+}
+
 // chatDeadlineFromCtx derives the internal deadline from the context's
 // deadline, leaving a 10-second safety margin so the auto-continue path
 // triggers BEFORE ctx.Done() kills the request. If the context has no
@@ -393,6 +479,27 @@ func chatDeadlineFromCtx(ctx context.Context) time.Time {
 		return dl.Add(-10 * time.Second)
 	}
 	return time.Now().Add(8 * time.Minute)
+}
+
+// continueConversationHop asks the model, in the same conversation, to finish
+// what it left off. Budget per hop: maxContinueTimeout, client disconnects
+// still cancel it.
+func (c *Client) continueConversationHop(parentCtx context.Context, acc Account, req Request, onDelta func(string) error, onEvent StreamHandler, depth int) (Result, error) {
+	continueReq := req
+	continueReq.Text = "请继续刚才未完成的回答，直接从你中断的地方继续，不要重复已说的内容。"
+	continueReq.Started = false
+	continueCtx, continueCancel := context.WithTimeout(context.Background(), maxContinueTimeout)
+	defer continueCancel()
+	go func() {
+		select {
+		case <-parentCtx.Done():
+			if parentCtx.Err() == context.Canceled {
+				continueCancel()
+			}
+		case <-continueCtx.Done():
+		}
+	}()
+	return c.chatWithHandlersDepth(continueCtx, acc, continueReq, onDelta, onEvent, depth+1)
 }
 
 // chatWithHandlersDepth is the core implementation with a depth counter
@@ -666,6 +773,10 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 			return emitDelta(snapshot[len(cur):])
 		}
 		if len(snapshot) <= len(cur) {
+			// A rewrite that is shorter (or equally short) is invisible
+			// without counting; when type-2's final message is missing too
+			// this is an unrecoverable divergence — make it observable.
+			skippedSnapshots++
 			return nil
 		}
 		skippedSnapshots++
@@ -930,6 +1041,17 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 						if ev.Kind == "reasoning" {
 							reasoningBuf.WriteString(ev.Text)
 						}
+						// tools also appear INSIDE messages[]; extractToolEvents
+						// already claimed them via seenStreamTools. Without the
+						// same dedupe here the client receives each native call
+						// twice under two different call ids.
+						if ev.Kind == "tool" && len(ev.Arguments) > 0 {
+							tkey := ev.ToolName + "|" + string(ev.Arguments)
+							if seenStreamTools[tkey] {
+								continue
+							}
+							seenStreamTools[tkey] = true
+						}
 						ev.Raw = eventRaw(arg)
 						if ev.Kind != "text" && onEvent != nil {
 							if err := onEvent(ev); err != nil {
@@ -1193,6 +1315,38 @@ func (c *Client) chatWithHandlersDepth(ctx context.Context, acc Account, req Req
 				if IsContentPolicyBlock(text) {
 					returnConn = false
 					return Result{}, ErrOffensiveContent
+				}
+				if continueOnComplete && depth < maxAutoContinue && len(req.Tools) == 0 && len(seenStreamTools) == 0 && looksLengthTruncated(text) {
+					log.Printf("[chathub] completed reply looks length-truncated (chars=%d); continuing same conversation (depth=%d)", len(text), depth)
+					cont, contErr := c.continueConversationHop(ctx, acc, req, onDelta, onEvent, depth)
+					if contErr != nil {
+						log.Printf("[chathub] completion-continuation hop failed (depth=%d): %v; keeping original", depth+1, contErr)
+					} else if !adoptContinuation(cont.Text) {
+						log.Printf("[chathub] continuation hop returned no missing content (chars=%d); keeping original", len(cont.Text))
+					} else {
+						text += cont.Text
+						events = append(events, cont.Events...)
+						if len(suggestions) == 0 {
+							suggestions = cont.SuggestedResponses
+						}
+						if cont.Throttling != nil {
+							throttling = cont.Throttling
+						}
+						if cont.StorageMessageID != "" {
+							storageMessageID = cont.StorageMessageID
+						}
+						if len(scores) == 0 {
+							scores = cont.Scores
+						}
+						if meteringInformation == nil {
+							meteringInformation = cont.MeteringInformation
+						}
+						for k, v := range cont.References {
+							if _, exists := references[k]; !exists {
+								references[k] = v
+							}
+						}
+					}
 				}
 				result := Result{
 					Text:                      text,

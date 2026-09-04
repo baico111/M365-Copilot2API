@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -187,6 +188,21 @@ type ResolveResult struct {
 	HistoryLen int
 }
 
+// sharedPrefixLen returns how many leading stored messages are identical to
+// the incoming ones (messagesEqual semantics: role+text+tool-calls, IDs
+// ignored). Used to detect mid-session history rewrites.
+func sharedPrefixLen(stored, incoming []oaiMsg) int {
+	n := len(stored)
+	if len(incoming) < n {
+		n = len(incoming)
+	}
+	i := 0
+	for i < n && messagesEqual(stored[i], incoming[i]) {
+		i++
+	}
+	return i
+}
+
 func clientIPFingerprint(r *http.Request) string {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 	ua := r.Header.Get("User-Agent")
@@ -229,6 +245,22 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 				sess.LastUsedAt = time.Now().UTC()
 				sr.sessions[sessID] = sess
 				sr.persist.markDirty()
+				// The stored history must be a true prefix of the incoming
+				// messages before incremental sending is safe. Tools such as
+				// Claude Code rewrite history mid-session (auto-compact,
+				// pruning); resuming the old thread would slice the delta at
+				// a stale boundary and silently lose context. When the prefix
+				// broke, KEEP the account binding (stable exit IP + quota for
+				// this session) but start a fresh conversation with a full
+				// resend; Bind() re-attaches the explicit id to the new
+				// conversation so later turns go incremental again.
+				if sess.ConversationID != "" && sharedPrefixLen(sess.ContextHistory, body.Messages) < len(sess.ContextHistory) {
+					log.Printf("[session-resolver] explicit session history rewritten; keeping account=%s and starting a fresh conversation session=%s", sess.AccountID, sess.SessionID)
+					// ConversationID/SessionID cleared => the handler keeps
+					// AccountID pinned (a brand-new cloud conversation, full
+					// resend), instead of round-robining to a random account.
+					return ResolveResult{MatchedBy: "explicit_reset", IsNew: false, AccountID: sess.AccountID}
+				}
 				return ResolveResult{
 					SessionID:      sess.SessionID,
 					ConversationID: sess.ConversationID,
@@ -274,7 +306,12 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 			AccountID:      sess.AccountID,
 			MatchedBy:      fmt.Sprintf("context_suffix_%d", suffixN),
 			IsNew:          false,
-			HistoryLen:     suffixN,
+			// suffixN counts the matched SUFFIX, but callers slice
+			// messages[HistoryLen:] expecting a PREFIX boundary — using
+			// suffixN here would drop the leading messages (system prompt
+			// included). Full resend is the documented intent for suffix
+			// matches.
+			HistoryLen: 0,
 		}
 	}
 

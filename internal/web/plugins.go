@@ -40,7 +40,7 @@ func (pc *pluginCache) set(accountID string, data json.RawMessage) {
 	pc.entries[accountID] = pluginCacheEntry{data: data, fetchedAt: time.Now()}
 }
 
-func (s *Server) fetchPlugins(ctx context.Context, accessToken string) (json.RawMessage, error) {
+func (s *Server) fetchPlugins(ctx context.Context, client *http.Client, accessToken string) (json.RawMessage, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://substrate.office.com/m365Copilot/EventListener/Client?EventId=ExecuteAction", nil)
 	if err != nil {
 		return nil, err
@@ -48,7 +48,7 @@ func (s *Server) fetchPlugins(ctx context.Context, accessToken string) (json.Raw
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0")
-	resp, err := s.chat.HTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +87,7 @@ func (s *Server) plugins(w http.ResponseWriter, r *http.Request) {
 	}
 	pctx, pcancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer pcancel()
-	data, err := s.fetchPlugins(pctx, acc.AccessToken)
+	data, err := s.fetchPlugins(pctx, s.accountClient(acc.ID).HTTPClient, acc.AccessToken)
 	if err != nil {
 		writeUpstreamError(w, err)
 		return

@@ -2,6 +2,7 @@ package chathub
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -67,6 +68,8 @@ func NewConnPool(dialer *websocket.Dialer, header http.Header) *ConnPool {
 
 func (p *ConnPool) key(oid, tid string) string { return oid + "|" + tid }
 
+var errPoolStalled = errors.New("chathub: pooled connection relay stalled")
+
 // startPark keeps a parked connection alive by answering SignalR pings while
 // it waits in the pool. The pump is the connection's PERMANENT single reader:
 // gorilla poisons a conn after any read error (including deadline expiry), so
@@ -100,6 +103,14 @@ func (p *ConnPool) startPark(key string, pc *pooledConn) {
 				select {
 				case pc.frames <- msg:
 				case <-time.After(30 * time.Second):
+					// Consumer stalled: the Chat side select would hang on
+					// frames/errs until its own deadline killed the request.
+					// End the stream explicitly so it fails over fast.
+					select {
+					case pc.errs <- errPoolStalled:
+					default:
+					}
+					close(pc.frames)
 					return
 				}
 			}
@@ -110,14 +121,22 @@ func (p *ConnPool) startPark(key string, pc *pooledConn) {
 func (p *ConnPool) evict(key string, target *pooledConn) {
 	p.mu.Lock()
 	conns := p.conns[key]
+	found := false
 	for i, pc := range conns {
 		if pc == target {
 			p.conns[key] = append(conns[:i], conns[i+1:]...)
+			found = true
 			break
 		}
 	}
 	p.mu.Unlock()
-	target.conn.Close()
+	// Only close what we actually removed. An entry that is NOT in the map
+	// anymore may have been handed to Chat between Take's unlock and its
+	// taken mark; closing it killed a just-delivered connection and lost
+	// the whole request (looked like a random 502/empty completion).
+	if found {
+		target.conn.Close()
+	}
 }
 
 func (p *ConnPool) Take(ctx context.Context, oid, tid string, wsURL string) (*websocket.Conn, *sync.Mutex, <-chan []byte, <-chan error, bool, error) {
@@ -141,6 +160,10 @@ func (p *ConnPool) Take(ctx context.Context, oid, tid string, wsURL string) (*we
 	for _, pc := range conns {
 		if picked == nil && pc.handshook && time.Since(pc.created) < poolConnTTL {
 			picked = pc
+			// Claim under the lock: the old window between Unlock and
+			// taken.Store let the pump see taken==false and race into
+			// evict() for a connection that is about to be used.
+			pc.taken.Store(true)
 			continue
 		}
 		if time.Since(pc.created) >= poolConnTTL {
@@ -162,7 +185,6 @@ func (p *ConnPool) Take(ctx context.Context, oid, tid string, wsURL string) (*we
 	}
 
 	if picked != nil {
-		picked.taken.Store(true)
 		log.Printf("[connpool] hit oid=%s age_ms=%d", oid, time.Since(picked.created).Milliseconds())
 		return picked.conn, &picked.writeMu, picked.frames, picked.errs, true, nil
 	}

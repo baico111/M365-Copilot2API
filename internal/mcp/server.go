@@ -44,6 +44,12 @@ func (r *toolRegistry) MergeTools(tools []Tool) {
 	}
 	for _, t := range tools {
 		if !existing[t.Name] {
+			// Bound the process-wide registry: client-supplied tool lists
+			// were otherwise an unbounded growth vector visible across
+			// tenants via tools/list.
+			if len(r.tools) >= 256 {
+				break
+			}
 			r.tools = append(r.tools, t)
 		}
 	}

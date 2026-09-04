@@ -38,6 +38,11 @@ func (c *ToolCache) Merge(tools []Tool) {
 	}
 	for _, t := range tools {
 		if !existing[t.Name] {
+			// Bound the process-wide registry: unbounded client-supplied
+			// entries were a memory-growth vector.
+			if len(c.tools) >= 256 {
+				break
+			}
 			c.tools = append(c.tools, t)
 		}
 	}

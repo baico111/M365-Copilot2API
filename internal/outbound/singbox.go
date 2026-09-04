@@ -1,6 +1,7 @@
 package outbound
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -1091,19 +1092,17 @@ func checkNodeHealth(idx int) {
 	tcpConn.Close()
 	latency := time.Since(tcpStart)
 
-	// Step 2: Mark node as healthy based on TCP connectivity alone.
-	// We intentionally do NOT do an HTTP request through the proxy
-	// because:
-	// 1. Cloudflare proxy nodes return 403 for gstatic.com (WAF block),
-	//    which sing-box logs as "unexpected HTTP response status: 403"
-	//    on every health check — filling the logs with noise.
-	// 2. The 403 is NOT a proxy failure — the proxy works fine for
-	//    substrate.office.com (the actual upstream target).
-	// 3. The TCP check above already confirmed sing-box is running,
-	//    the SOCKS5 port is listening, and the proxy handshake completed.
-	//
-	// If we need HTTP latency measurement in the future, use a target
-	// that doesn't block CF nodes (e.g. substrate.office.com itself).
+	// Step 2: Egress probe THROUGH this node. TCP-to-the-local-SOCKS-port
+	// only proves sing-box's inbound is listening — a dead upstream tunnel
+	// still passes it, so the old TCP-only check let broken nodes advertise
+	// "healthy" while every chat through them failed (the observed "proxy
+	// says fine but 502 storm" pattern). Probe substrate.office.com itself:
+	// it is the exact host the gateway dials, and any HTTP status below 500
+	// (200/401/403/404...) proves the TCP+TLS+proxy path to Microsoft works.
+	if clients == nil || !nodeEgressReachable(clients.HTTP) {
+		recordNodeFailure(idx, fmt.Errorf("egress probe through node %d (port %d) failed for substrate.office.com", idx, port))
+		return
+	}
 	nh.mu.Lock()
 	nh.health = "healthy"
 	nh.failures = 0
@@ -1116,6 +1115,24 @@ func checkNodeHealth(idx int) {
 		nh.isolatedAt = time.Time{}
 	}
 	nh.mu.Unlock()
+}
+
+// nodeEgressReachable performs one small probe through the node's SOCKS
+// client. Status <500 (or any transport success) counts as reachable; a
+// status >=500 or transport error means the tunnel cannot carry traffic.
+func nodeEgressReachable(client *http.Client) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://substrate.office.com/", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode < 500
 }
 
 // recordNodeFailure records a failed health check for a node and isolates
@@ -1216,26 +1233,65 @@ func SingBoxRunning() bool {
 	return sbProcess != nil
 }
 
-// SingBoxNodeInfo returns the node index and name assigned to a given
-// account ID, plus the node's health status. Returns empty strings and
-// false if sing-box is not running or the account has no node assignment.
-func SingBoxNodeInfo(accountID string) (int, string, string, bool) {
+// PickNodeForAccount is the SINGLE source of truth for account → node
+// affinity. Both request routing (web.accountClient) and the admin UI
+// (SingBoxNodeInfo) must go through it. The previous two-path implementation
+// hashed accountID modulo the NON-isolated count in one place and modulo the
+// TOTAL count in the other: every time a single node was isolated, every
+// account's home node drifted at once (mass simultaneous exit-IP churn — the
+// exact pattern M365 fraud systems punish), and the UI showed nodes the
+// account never actually used.
+//
+// home = hash % total is stable across isolation state; when the home node is
+// isolated the picker walks forward to the nearest healthy node, so ONLY the
+// accounts homed on that one node move (minimal churn), and they walk back to
+// their original home as soon as it recovers. When every node is unhealthy the
+// urltest selector client is returned — account traffic never silently goes
+// direct while sing-box itself is alive. ok=false means no per-node pool (or
+// sing-box dead): callers fall back to their existing behaviour.
+func PickNodeForAccount(accountID string) (clients *Clients, idx int, name, health string, ok bool) {
 	sbMu.Lock()
 	defer sbMu.Unlock()
-	if sbNodeClients == nil || len(sbNodeClients) == 0 || len(sbNodeList) == 0 {
+	total := len(sbNodeClients)
+	if total == 0 {
+		return sbClients, -1, "", "", false
+	}
+	home := int(stableHash(accountID) % uint64(total))
+	for i := 0; i < total; i++ {
+		node := (home + i) % total
+		c := sbNodeClients[node]
+		if c == nil {
+			continue
+		}
+		nh := sbNodeHealth[node]
+		if nh != nil && nh.isolated {
+			continue
+		}
+		h := "unknown"
+		if nh != nil {
+			nh.mu.Lock()
+			h = nh.health
+			nh.mu.Unlock()
+		}
+		nm := ""
+		if node < len(sbNodeList) {
+			nm = sbNodeList[node]
+		}
+		return c, node, nm, h, true
+	}
+	// All per-node inbounds unhealthy: use the urltest selector (it still
+	// egresses through sing-box, just picks the best tunnel itself).
+	log.Printf("[sing-box] all per-node candidates isolated; account %s falls back to urltest selector", accountID)
+	_ = home
+	return sbClients, -1, "urltest-fallback", "fallback", sbClients != nil
+}
+
+// SingBoxNodeInfo returns the node ACTUALLY selected for an account (same
+// algorithm as request routing) plus its health, for admin display.
+func SingBoxNodeInfo(accountID string) (int, string, string, bool) {
+	c, idx, name, health, ok := PickNodeForAccount(accountID)
+	if !ok || c == nil {
 		return 0, "", "", false
-	}
-	n := len(sbNodeClients)
-	idx := int(stableHash(accountID) % uint64(n))
-	name := ""
-	if idx < len(sbNodeList) {
-		name = sbNodeList[idx]
-	}
-	health := "unknown"
-	if nh, ok := sbNodeHealth[idx]; ok && nh != nil {
-		nh.mu.Lock()
-		health = nh.health
-		nh.mu.Unlock()
 	}
 	return idx, name, health, true
 }

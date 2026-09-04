@@ -27,7 +27,10 @@ type flagsCacheEntry struct {
 }
 
 func (s *Server) memoryAccount(r *http.Request) (auth.AccountToken, bool) {
-	acc, err := s.resolveAccount("")
+	// Honor ?account= like /api/plugins does. Plain round-robin here made every
+	// request hit a DIFFERENT account: writes land on one M365 profile while
+	// reads returned another one's private personalization/custom instructions.
+	acc, err := s.resolveAccount(strings.TrimSpace(r.URL.Query().Get("account")))
 	if err != nil {
 		return auth.AccountToken{}, false
 	}
@@ -81,6 +84,10 @@ func proxySubstrate(w http.ResponseWriter, targetURL string, method string, acc 
 }
 
 func (s *Server) memoryGetFlags(w http.ResponseWriter, r *http.Request) {
+	if !s.validAdminSession(r) {
+		writeOpenAIError(w, http.StatusUnauthorized, "auth_error", "administrator login required")
+		return
+	}
 	acc, ok := s.memoryAccount(r)
 	if !ok {
 		writeOpenAIError(w, http.StatusBadGateway, "account_error", "no account available")
@@ -142,6 +149,10 @@ func (s *Server) memoryPatchFlags(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) memoryGetInstructions(w http.ResponseWriter, r *http.Request) {
+	if !s.validAdminSession(r) {
+		writeOpenAIError(w, http.StatusUnauthorized, "auth_error", "administrator login required")
+		return
+	}
 	acc, ok := s.memoryAccount(r)
 	if !ok {
 		writeOpenAIError(w, http.StatusBadGateway, "account_error", "no account available")

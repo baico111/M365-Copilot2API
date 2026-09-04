@@ -50,9 +50,14 @@ func extractToolFields(m map[string]any) (string, json.RawMessage) {
 		return "", nil
 	}
 	for _, k := range []string{"arguments", "args", "parameters", "input", "functionArguments"} {
-		if v, ok := m[k]; ok {
+		if v, ok := m[k]; ok && v != nil {
 			b, err := json.Marshal(v)
-			if err == nil && len(b) > 0 {
+			// "null" (4 bytes) would otherwise turn every ChatHub card that
+			// carries one of these key names with a null value into a bogus
+			// tool event: extra repair calls, and worst of all it flips
+			// seenStreamTools non-empty which disables the
+			// length-truncation auto-continuation for the real answer.
+			if err == nil && len(b) > 0 && string(b) != "null" {
 				return name, b
 			}
 		}

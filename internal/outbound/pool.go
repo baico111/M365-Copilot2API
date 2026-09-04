@@ -74,7 +74,7 @@ func isProxyError(err error) bool {
 	if strings.Contains(s, "429") && strings.Contains(s, "upstream") {
 		return false
 	}
-	if strings.Contains(s, "socks") || strings.Contains(s, "no such host") || strings.Contains(s, "dns") && !strings.Contains(s, "limited") || strings.Contains(s, "tls") || strings.Contains(s, "certificate") || strings.Contains(s, "x509") || strings.Contains(s, "handshake") || strings.Contains(s, "timeout") || strings.Contains(s, "deadline exceeded") || strings.Contains(s, "connection refused") || strings.Contains(s, "connection reset") || strings.Contains(s, "network is unreachable") || strings.Contains(s, "ws_read_timeout") || strings.Contains(s, "ws_handshake") {
+	if strings.Contains(s, "socks") || strings.Contains(s, "no such host") || strings.Contains(s, "dns") && !strings.Contains(s, "limited") || strings.Contains(s, "tls") || strings.Contains(s, "certificate") || strings.Contains(s, "x509") || strings.Contains(s, "handshake") || strings.Contains(s, "timeout") || strings.Contains(s, "deadline exceeded") || strings.Contains(s, "connection refused") || strings.Contains(s, "connection reset") || strings.Contains(s, "broken pipe") || strings.Contains(s, "unexpected eof") || strings.Contains(s, "use of closed network connection") || strings.Contains(s, "network is unreachable") || strings.Contains(s, "ws_read_timeout") || strings.Contains(s, "ws_handshake") {
 		return true
 	}
 	if strings.Contains(s, "proxy connect") || strings.Contains(s, "socks5") {

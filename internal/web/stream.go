@@ -54,6 +54,25 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
 	defer cancel()
+	// A cloud conversation is a strictly sequential ChatHub resource. When
+	// several tools hammer one model concurrently, the session-key/user/
+	// content-key/conv-cache reuse paths can all hand the SAME conversation
+	// to more than one in-flight request, and racing posts interleave on the
+	// upstream thread (queued turns, cross-answered prompts, corrupted
+	// history). Briefly wait for the in-flight turn; if it stays busy,
+	// gracefully drop the reuse (fresh conversation, full prompt) instead of
+	// corrupting it.
+	releaseConv := func() {}
+	if body.ConversationID != "" {
+		var convOK bool
+		releaseConv, convOK = s.convGate.acquire(ctx, acc.ID+"|"+body.ConversationID, 4*time.Second)
+		if !convOK {
+			log.Printf("[conv-gate] conversation busy, reusing a fresh conversation instead: account=%s conversation=%s", acc.ID, body.ConversationID)
+			body.ConversationID = ""
+			body.SessionID = ""
+		}
+	}
+	defer releaseConv()
 	streamSettings := s.settings.get()
 	servingAccountID := acc.ID
 	opts := []chatCallOption{withServingAccount(&servingAccountID)}

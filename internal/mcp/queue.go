@@ -49,16 +49,20 @@ func (q *ToolCallQueue) Enqueue(name string, arguments map[string]any) *PendingT
 	return call
 }
 
-// Dequeue waits for and returns the next pending tool call.
-// Returns nil if the context is cancelled or no call arrives before the context deadline.
+// Dequeue waits for and returns the next live pending tool call.
+// Expired entries (older than callTTL) are dropped instead of returned:
+// executing a tool call whose handler already gave up is a ghost side effect
+// whose result goes nowhere.
 func (q *ToolCallQueue) Dequeue(ctx context.Context) *PendingToolCall {
 	for {
 		q.mu.Lock()
-		if len(q.pending) > 0 {
+		for len(q.pending) > 0 {
 			call := q.pending[0]
 			q.pending = q.pending[1:]
-			q.mu.Unlock()
-			return call
+			if time.Since(call.CreatedAt) <= callTTL {
+				q.mu.Unlock()
+				return call
+			}
 		}
 		q.mu.Unlock()
 		select {
@@ -74,12 +78,32 @@ func (q *ToolCallQueue) Dequeue(ctx context.Context) *PendingToolCall {
 func (q *ToolCallQueue) DequeueNonBlocking() *PendingToolCall {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if len(q.pending) == 0 {
-		return nil
+	for len(q.pending) > 0 {
+		call := q.pending[0]
+		q.pending = q.pending[1:]
+		if time.Since(call.CreatedAt) <= callTTL {
+			return call
+		}
 	}
-	call := q.pending[0]
-	q.pending = q.pending[1:]
-	return call
+	return nil
+}
+
+// callTTL bounds how long an unclaimed queued call may be executed at all.
+const callTTL = 60 * time.Second
+
+// remove drops call from the queue (pointer identity). Without it a timed
+// out or cancelled CallTool left its entry in pending forever: memory
+// growth plus, worse, a later Dequeue delivering a zombie call whose
+// result has no reader.
+func (q *ToolCallQueue) remove(call *PendingToolCall) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i, c := range q.pending {
+		if c == call {
+			q.pending = append(q.pending[:i], q.pending[i+1:]...)
+			return
+		}
+	}
 }
 
 // Resolve sends the result for a pending tool call, unblocking the onCall handler.
@@ -142,15 +166,19 @@ func (p *MCPToolProvider) CallTool(ctx context.Context, name string, arguments m
 	case err := <-call.ErrCh:
 		return CallResult{}, err
 	case <-timer.C:
-		// Timeout - the tool call has been returned to the user's client.
-		// Return a pending result so the MCP client knows the tool is being
-		// executed. The actual result will be forwarded in a subsequent turn.
+		// Remove first: the entry must not be executed later for nobody.
+		// Reporting a fake success ("result will be provided in a
+		// subsequent turn") was doubly wrong — no such forwarding exists, and
+		// the model then waits for a result that never arrives.
+		p.queue.remove(call)
 		return CallResult{
 			Content: []map[string]any{
-				{"type": "text", "text": fmt.Sprintf("Tool call %s has been forwarded to the client for execution. The result will be provided in a subsequent turn.", name)},
+				{"type": "text", "text": fmt.Sprintf("Tool call %s was not executed: the client did not respond within %s.", name, timeout)},
 			},
+			IsError: true,
 		}, nil
 	case <-ctx.Done():
+		p.queue.remove(call)
 		return CallResult{}, ctx.Err()
 	}
 }

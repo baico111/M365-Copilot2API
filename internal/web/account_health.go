@@ -190,7 +190,7 @@ func ClassifyError(err error) ErrorCategory {
 		return CategoryWSHandshake
 	case strings.Contains(msg, "ws read") || (strings.Contains(msg, "timeout") && strings.Contains(msg, "read")) || strings.Contains(msg, "deadline exceeded"):
 		return CategoryWSReadTimeout
-	case strings.Contains(msg, "connection refused") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "network is unreachable"):
+	case strings.Contains(msg, "connection refused") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "unexpected eof") || strings.Contains(msg, "use of closed network connection") || strings.Contains(msg, "network is unreachable"):
 		return CategoryTCP
 	case strings.Contains(msg, "client canceled") || strings.Contains(msg, "context canceled"):
 		return CategoryClientCanceled

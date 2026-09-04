@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"sync"
@@ -35,10 +36,16 @@ func StartStdio(ctx context.Context, command string, args []string, opts any) (*
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	scn := bufio.NewScanner(stdout)
+	// Tool results are single JSON lines and can far exceed the 64KB default
+	// buffer: on overflow Scan() stops with ErrTooLong, the read loop exits
+	// SILENTLY and the child blocks on the full stdout pipe — the whole
+	// bridge deadlocks. 8 MiB headroom plus error logging below.
+	scn.Buffer(make([]byte, 64*1024), 8<<20)
 	c := &StdioClient{
 		cmd:     cmd,
 		stdin:   stdin,
-		stdout:  bufio.NewScanner(stdout),
+		stdout:  scn,
 		pending: map[int64]chan json.RawMessage{},
 		done:    make(chan struct{}),
 	}
@@ -47,7 +54,24 @@ func StartStdio(ctx context.Context, command string, args []string, opts any) (*
 }
 
 func (c *StdioClient) readLoop() {
-	defer close(c.done)
+	defer func() {
+		if err := c.stdout.Err(); err != nil {
+			fmt.Printf("[mcp-stdio] reader terminated: %v\n", err)
+		}
+		// Release every waiter BEFORE closing done's dependents: callers may
+		// already have removed their entries; select/default keeps this
+		// non-blocking either way.
+		c.mu.Lock()
+		for id, ch := range c.pending {
+			select {
+			case ch <- nil:
+			default:
+			}
+			delete(c.pending, id)
+		}
+		c.mu.Unlock()
+		close(c.done)
+	}()
 	for c.stdout.Scan() {
 		line := c.stdout.Bytes()
 		if len(line) == 0 {
@@ -95,6 +119,10 @@ func (c *StdioClient) call(ctx context.Context, method string, id int64, params 
 	select {
 	case raw := <-ch:
 		return raw, nil
+	case <-c.done:
+		// Reader exited (process died or line overflow): fail fast instead
+		// of hanging every caller until its own ctx deadline.
+		return nil, errors.New("stdio: reader terminated")
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

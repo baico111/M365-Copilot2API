@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"m365-copilot2api/internal/outbound"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -28,8 +29,20 @@ func NewM365CloudClient(clientID, tenantID, refreshToken string) *M365CloudClien
 		clientID:     clientID,
 		tenantID:     tenantID,
 		refreshToken: refreshToken,
-		httpClient:   &http.Client{Timeout: 30 * time.Second},
+		// Must share the configured outbound egress (sing-box / pool / proxy):
+		// with a direct client these calls would come from the host's real IP
+		// while chat traffic egresses residential proxies — a mismatched IP
+		// fingerprint across the same account session that invites risk
+		// prompts. Clone() keeps the proxy config with a private Timeout.
+		httpClient: cloneHTTPWithTimeout(30 * time.Second),
 	}
+}
+
+// cloneHTTPWithTimeout reuses the global outbound chain (sing-box / proxy
+// pool / explicit proxy) with a private per-call timeout.
+func cloneHTTPWithTimeout(d time.Duration) *http.Client {
+	base := outbound.HTTPClient()
+	return &http.Client{Transport: base.Transport, Timeout: d}
 }
 
 func (c *M365CloudClient) updateRefreshToken(newToken string) {
