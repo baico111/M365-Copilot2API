@@ -50,10 +50,15 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 		if name == "bash" || name == "sh" || name == "shell" || name == "powershell" || name == "cmd" {
 			converted := name
 			if !allowed[name] {
-				if shell == "" {
+				// Declared names are usually capitalised by clients (Bash);
+				// fuzzy-resolve before falling back to the lowercase shell.
+				if cand := lookupToolName(name, tools); cand != "" {
+					converted = cand
+				} else if shell == "" {
 					continue
+				} else {
+					converted = shell
 				}
-				converted = shell
 			}
 			if m, ok := v.(map[string]any); ok {
 				if cmd, hasCmd := m["command"]; hasCmd && cmd != "" {
@@ -69,7 +74,14 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 			}
 			continue
 		}
-		if !allowed[name] || !toolChoiceAllows(choice, name) {
+		if !allowed[name] {
+			if cand := lookupToolName(name, tools); cand != "" {
+				name = cand
+			} else {
+				continue
+			}
+		}
+		if !toolChoiceAllows(choice, name) {
 			continue
 		}
 		if v == nil {

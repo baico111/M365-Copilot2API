@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"m365-copilot2api/internal/chathub"
 	"strings"
 
@@ -55,7 +56,17 @@ func validateDetectedToolCalls(calls []detectedToolCall, tools []map[string]any,
 	for _, call := range calls {
 		fn := toolFunction(call.Name, tools)
 		if fn == nil {
-			rejected = append(rejected, rejectedToolCall{Name: call.Name, Reason: "tool was not declared by the client"})
+			// cnb2api methodology: map the model's habit spelling (bash/read_file/
+			// execute/...) onto a DECLARED tool before condemning it as unknown.
+			if resolved := lookupToolName(call.Name, tools); resolved != "" {
+				log.Printf("[tool-validation] fuzzy-mapped tool name %q -> %q", call.Name, resolved)
+				call.Name = resolved
+				call.Type = ""
+				fn = toolFunction(call.Name, tools)
+			}
+		}
+		if fn == nil {
+			rejected = append(rejected, rejectedToolCall{Name: call.Name, Reason: "no such tool declared. Available tools: " + strings.Join(declaredToolNames(tools), ", ")})
 			continue
 		}
 		if !toolChoiceAllows(choice, call.Name) {
@@ -63,11 +74,28 @@ func validateDetectedToolCalls(calls []detectedToolCall, tools []map[string]any,
 			continue
 		}
 		args := map[string]any{}
-		if len(call.Arguments) == 0 || string(call.Arguments) == "null" {
+		raw := string(call.Arguments)
+		trimmed := strings.TrimSpace(raw)
+		switch {
+		case len(call.Arguments) == 0 || trimmed == "" || trimmed == "null":
 			call.Arguments = json.RawMessage(`{}`)
-		} else if err := json.Unmarshal(call.Arguments, &args); err != nil {
-			rejected = append(rejected, rejectedToolCall{Name: call.Name, Reason: "arguments are not a JSON object"})
-			continue
+		default:
+			parsed, ok := lenientParseObject(raw)
+			if !ok || parsed == nil {
+				rejected = append(rejected, rejectedToolCall{Name: call.Name, Reason: "arguments are not a JSON object"})
+				continue
+			}
+			args = parsed
+		}
+		props := schemaProperties(fn)
+		required := schemaRequired(fn)
+		normalizeToolArgs(args, props, required)
+		fillRequiredDefaults(args, props, required)
+		if props != nil {
+			coerceNumericTypes(args, props)
+		}
+		if b, err := json.Marshal(args); err == nil {
+			call.Arguments = b
 		}
 		if err := schemaValid(args, fn); err != nil {
 			rejected = append(rejected, rejectedToolCall{Name: call.Name, Reason: err.Error()})
@@ -82,6 +110,43 @@ func validateDetectedToolCalls(calls []detectedToolCall, tools []map[string]any,
 		valid = append(valid, call)
 	}
 	return valid, rejected
+}
+
+// buildToolRepairRule turns rejection details into an actionable repair
+// instruction. cnb2api's key insight: a repair round without the PRECISE
+// rejection reasons basically never converges — the model does not know what
+// it did wrong.
+func buildToolRepairRule(rejected []rejectedToolCall, tools []map[string]any) string {
+	seen := map[string]bool{}
+	var lines []string
+	for _, rj := range rejected {
+		// Name/Reason originate in model output; strip control chars so one
+		// crafted token cannot forge extra "rejection lines" in the prompt.
+		name := strings.Map(func(r rune) rune {
+			if r < 0x20 && r != ' ' {
+				return -1
+			}
+			return r
+		}, rj.Name)
+		line := fmt.Sprintf("- %s: %s", name, rj.Reason)
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		lines = append(lines, line)
+		if len(lines) >= 8 {
+			break
+		}
+	}
+	if len(lines) == 0 {
+		lines = append(lines, "- the previous tool selection was not parseable")
+	}
+	rule := "\nREPAIR RULE: Your previous tool selection was REJECTED with these errors:\n" + strings.Join(lines, "\n")
+	if avail := declaredToolNames(tools); len(avail) > 0 {
+		rule += "\nDECLARED TOOL NAMES (use exactly one of these): " + strings.Join(avail, ", ")
+	}
+	rule += "\nDo NOT invent new names; pick the declared tool matching the intent and emit ONLY that call. Never return unknown_tool."
+	return rule
 }
 
 func toolChoiceAllows(choice any, name string) bool {

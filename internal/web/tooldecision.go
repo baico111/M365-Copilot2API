@@ -46,12 +46,13 @@ func validateJSONSchema(value any, schema map[string]any, path string) error {
 		if !ok {
 			return fmt.Errorf("%s must be object", path)
 		}
-		if req, ok := schema["required"].([]any); ok {
-			for _, raw := range req {
-				n, _ := raw.(string)
-				if _, yes := m[n]; !yes {
-					return fmt.Errorf("missing required argument %s", n)
-				}
+		// extractRequiredList accepts both []any (JSON-decoded schemas, the
+		// production shape) and []string (Go-constructed schemas from tests
+		// and internal callers) — the old .([]any) assertion silently skipped
+		// the entire required check for the latter.
+		for _, n := range extractRequiredList(schema["required"]) {
+			if _, yes := m[n]; !yes {
+				return fmt.Errorf("missing required argument %s", n)
 			}
 		}
 		props, _ := schema["properties"].(map[string]any)

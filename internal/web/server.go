@@ -2229,12 +2229,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		mcpServerURL = fmt.Sprintf("%s://%s/v1/mcp/sse", scheme, r.Host)
 		log.Printf("[mcp] tools=%d mcp_gateway=%s", len(toolMaps), mcpServerURL)
 	}
-	validateCalls := func(stage string, calls []detectedToolCall) ([]detectedToolCall, int) {
+	validateCalls := func(stage string, calls []detectedToolCall) ([]detectedToolCall, []rejectedToolCall) {
 		valid, rejected := validateDetectedToolCalls(calls, toolMaps, body.ToolChoice)
 		for _, call := range rejected {
 			log.Printf("[tool-validation] id=%s stage=%s rejected_name=%q reason=%q", requestID, stage, call.Name, call.Reason)
 		}
-		return valid, len(rejected)
+		return valid, rejected
 	}
 	planningMode := s.settings.get().ToolPlanningMode
 	toolCfg := s.settings.get()
@@ -2655,12 +2655,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		calls, rejected := validateCalls("stream", rawCalls)
 		toolResult := chathub.Result{Text: text.String()}
-		if len(calls) == 0 && rejected > 0 {
+		if len(calls) == 0 && len(rejected) > 0 {
 			// A native ChatHub event can contain a fabricated or empty tool name.
 			// Do not leak it to the local runner: ask the model to remap the intent
 			// to exactly one of the tools the client actually declared.
 			repairPrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, "required") +
-				"\nREPAIR RULE: The previous upstream event selected an undeclared tool. Select one declared tool that performs the intended operation. Never return unknown_tool."
+				buildToolRepairRule(rejected, toolMaps)
 			repairOpts := []chatCallOption{}
 			if body.AccountID != "" {
 				repairOpts = append(repairOpts, withPinnedAccount())
@@ -2676,9 +2676,25 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if len(calls) == 0 {
-				log.Printf("[tool-validation] id=%s stage=stream-repair failed", requestID)
-				_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": "upstream selected an undeclared tool and repair failed", "code": "invalid_tool_call"}})+"\n\n")
-				_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
+				// cnb2api methodology: a mangled tool block must never hard-abort
+				// the turn. The repair round already carried the precise rejection
+				// list and still failed, so DEGRADE: deliver sanitized prose as a
+				// normal completion. Half-formed tool calls are never emitted; the
+				// user's session stays alive instead of dead-stopping.
+				log.Printf("[tool-validation] id=%s stage=stream-repair failed; degrading to prose (no tool_calls emitted)", requestID)
+				prose := text.String()
+				if pending.Len() > 0 {
+					prose += "\n" + pending.String()
+				}
+				if prose = sanitizeToolCallText(prose, toolMaps); prose != "" {
+					_ = emitText(prose)
+					flushText()
+				}
+				finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
+				_ = sw.data(mustJSON(finishChunk))
+				_ = sw.data("[DONE]")
+				s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
+				s.storeConvCache(convCacheSessionKey, acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 				return
 			}
 		}
@@ -2770,8 +2786,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 			}
 			if !parsed {
-				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "model returned an invalid tool routing decision")
-				return
+				// Degrade: the router round produced no usable decision; fall
+				// through to ordinary answer generation instead of killing the
+				// turn with a 502 that only teaches clients to retry-loop.
+				log.Printf("[tool-router] id=%s routing decision unparseable after repair; falling through to plain answer", requestID)
 			}
 		}
 		calls = filterCompletedCalls(calls, ledger)
@@ -2811,8 +2829,9 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					return
 				}
 			}
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "model did not select a required tool after constrained retry")
-			return
+			// Degrade to a plain answer as well: agents recover far better
+			// from prose than from an errored finish.
+			log.Printf("[tool-router] id=%s required selection still failed after retry; falling through to plain answer", requestID)
 		}
 	}
 	answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, mcpServerURL, s.settings.get(), s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession)
@@ -3187,9 +3206,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 	}
 	invalidDetectedTool := false
+	var allRejected []rejectedToolCall
 	if rawCalls := fencedToolCalls(res.Text, toolMaps, body.ToolChoice); len(rawCalls) > 0 {
 		calls, rejected := validateCalls("fenced", rawCalls)
-		invalidDetectedTool = rejected > 0
+		allRejected = append(allRejected, rejected...)
+		invalidDetectedTool = len(rejected) > 0
 		if len(calls) > 0 {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
@@ -3200,8 +3221,9 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 	}
 	if rawCalls := nativeToolCalls(res.Events, body.Tools); len(rawCalls) > 0 {
-		calls, rejected := validateCalls("native", rawCalls)
-		invalidDetectedTool = invalidDetectedTool || rejected > 0
+		calls, nativeRejected := validateCalls("native", rawCalls)
+		allRejected = append(allRejected, nativeRejected...)
+		invalidDetectedTool = invalidDetectedTool || len(nativeRejected) > 0
 		if len(calls) > 0 {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			if body.ParallelToolCalls != nil && !*body.ParallelToolCalls && len(calls) > 1 {
@@ -3215,6 +3237,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	// structured event that failed the declared-name/schema boundary.
 	if (planningMode == "native" || invalidDetectedTool) && len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" {
 		routePrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, body.ToolChoice)
+		if len(allRejected) > 0 {
+			// Teach the model WHICH selection was rejected for WHICH reason —
+			// a blind "pick a declared tool" prompt rarely converges.
+			routePrompt += buildToolRepairRule(allRejected, toolMaps)
+		}
 		nativeRouterOpts := []chatCallOption{}
 		if body.AccountID != "" {
 			nativeRouterOpts = append(nativeRouterOpts, withPinnedAccount())
