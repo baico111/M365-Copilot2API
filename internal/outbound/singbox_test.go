@@ -137,3 +137,95 @@ func TestReplacementRestartCoalesces(t *testing.T) {
 		t.Fatal("coalesced call must not clear another caller's latch")
 	}
 }
+
+// TestParseSingBoxJSONConfig verifies that a full sing-box JSON config (as
+// served by providers like BPB with ?app=sing-box) is parsed into proxy nodes
+// instead of yielding zero nodes. It mirrors the real outbound schema: a mix of
+// vless/trojan proxy outbounds plus selector/urltest/direct entries that must
+// be skipped.
+func TestParseSingBoxJSONConfig(t *testing.T) {
+	body := `{
+	  "log": {"level": "warn"},
+	  "outbounds": [
+	    {
+	      "tag": "1 - VLESS",
+	      "type": "vless",
+	      "server": "pbp.0731.de5.net",
+	      "server_port": 443,
+	      "uuid": "01784ec9-1500-4db8-9d00-9a99adb02cca",
+	      "tls": {"enabled": true, "server_name": "pBp.0731.DE5.NEt", "utls": {"enabled": true, "fingerprint": "chrome"}},
+	      "transport": {"type": "ws", "path": "/abc", "max_early_data": 2560, "early_data_header_name": "Sec-WebSocket-Protocol", "headers": {"Host": "pbp.0731.de5.net"}}
+	    },
+	    {
+	      "tag": "2 - Trojan",
+	      "type": "trojan",
+	      "server": "132.243.203.120",
+	      "server_port": 8443,
+	      "password": "secret",
+	      "tls": {"enabled": true}
+	    },
+	    {"tag": "selector", "type": "selector", "outbounds": ["1 - VLESS"]},
+	    {"tag": "direct", "type": "direct"},
+	    {"tag": "block", "type": "block"}
+	  ]
+	}`
+
+	nodes, err := parseSubscriptionBody(body)
+	if err != nil {
+		t.Fatalf("parseSubscriptionBody returned error: %v", err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("got %d nodes, want 2 (selector/direct/block skipped)", len(nodes))
+	}
+
+	v := nodes[0]
+	if v.Proto != "vless" || v.Address != "pbp.0731.de5.net" || v.Port != 443 {
+		t.Fatalf("vless node mis-parsed: %+v", v)
+	}
+	if !v.TLS || v.SNI != "pBp.0731.DE5.NEt" || v.FP != "chrome" {
+		t.Fatalf("vless tls mis-parsed: %+v", v)
+	}
+	if v.Network != "ws" || v.Path != "/abc" || v.Host != "pbp.0731.de5.net" {
+		t.Fatalf("vless transport mis-parsed: %+v", v)
+	}
+	if v.MaxEarlyData != 2560 || v.EarlyDataHeader != "Sec-WebSocket-Protocol" {
+		t.Fatalf("vless early data mis-parsed: %+v", v)
+	}
+
+	// The parsed early-data settings must survive into the generated sing-box
+	// outbound, otherwise the optimisation is silently dropped.
+	ob := buildSingBoxOutbound("t", v)
+	tr2, ok := ob["transport"].(map[string]any)
+	if !ok {
+		t.Fatalf("generated outbound missing transport: %+v", ob)
+	}
+	if tr2["max_early_data"] != 2560 || tr2["early_data_header_name"] != "Sec-WebSocket-Protocol" {
+		t.Fatalf("generated transport missing early data: %+v", tr2)
+	}
+
+	tr := nodes[1]
+	if tr.Proto != "trojan" || tr.UUID != "secret" || tr.Port != 8443 || !tr.TLS {
+		t.Fatalf("trojan node mis-parsed: %+v", tr)
+	}
+}
+
+// TestParseSubscriptionBodyURIsStillWork guards against the JSON branch
+// breaking the plain URI-list format that other providers serve.
+func TestParseSubscriptionBodyURIsStillWork(t *testing.T) {
+	body := "vless://uuid-1@1.2.3.4:443?type=ws&security=tls&sni=a.example.com&path=%2Fws#node-a\n" +
+		"trojan://pass-1@5.6.7.8:8443?sni=b.example.com#node-b"
+
+	nodes, err := parseSubscriptionBody(body)
+	if err != nil {
+		t.Fatalf("parseSubscriptionBody returned error: %v", err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("got %d nodes, want 2", len(nodes))
+	}
+	if nodes[0].Proto != "vless" || nodes[0].Address != "1.2.3.4" {
+		t.Fatalf("vless URI mis-parsed: %+v", nodes[0])
+	}
+	if nodes[1].Proto != "trojan" || nodes[1].Address != "5.6.7.8" {
+		t.Fatalf("trojan URI mis-parsed: %+v", nodes[1])
+	}
+}

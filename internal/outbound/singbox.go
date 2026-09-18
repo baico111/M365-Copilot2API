@@ -659,6 +659,11 @@ type vlessNode struct {
 	Proto    string // vless, vmess, ss
 	SSMethod string // shadowsocks method
 	SSPass   string // shadowsocks password
+	// WebSocket 0-RTT early data (sing-box ws transport). Both are taken from
+	// the upstream config when present so providers like BPB keep their early
+	// data optimisation and Sec-WebSocket-Protocol handshake.
+	MaxEarlyData    int
+	EarlyDataHeader string
 }
 
 func fetchSubscription(rawURL string) ([]vlessNode, error) {
@@ -749,6 +754,17 @@ func splitSubscriptionLines(body string) []string {
 
 func parseSubscriptionBody(body string) ([]vlessNode, error) {
 	body = strings.TrimSpace(body)
+
+	// Some providers serve a full sing-box JSON config when the client
+	// requests ?app=sing-box (or by default). Detect it by the leading '{'
+	// and extract the proxy outbounds; otherwise fall through to the
+	// URI / base64 parsing below.
+	if strings.HasPrefix(body, "{") {
+		if nodes, err := parseSingBoxJSONConfig(body); err == nil && len(nodes) > 0 {
+			return nodes, nil
+		}
+	}
+
 	// Try base64 decode only if the body doesn't look like plain-text URIs
 	if !strings.Contains(body, "://") {
 		if decoded, err := base64.StdEncoding.DecodeString(body); err == nil && isPrintable(decoded) {
@@ -796,6 +812,126 @@ func parseSubscriptionBody(body string) ([]vlessNode, error) {
 			}
 			nodes = append(nodes, node)
 		}
+	}
+	return nodes, nil
+}
+
+// parseSingBoxJSONConfig extracts proxy nodes from a full sing-box JSON config.
+// Providers such as BPB serve a complete config (with log/dns/inbounds/outbounds)
+// when the client advertises ?app=sing-box. Only vless, vmess, trojan and
+// shadowsocks outbounds are converted; selectors, urltest, direct and block
+// outbounds are skipped since they carry no server info of their own.
+func parseSingBoxJSONConfig(body string) ([]vlessNode, error) {
+	var cfg struct {
+		Outbounds []struct {
+			Tag        string `json:"tag"`
+			Type       string `json:"type"`
+			Server     string `json:"server"`
+			ServerPort any    `json:"server_port"`
+			UUID       string `json:"uuid"`
+			Password   string `json:"password"`
+			Method     string `json:"method"`
+			Network    string `json:"network"`
+			TLS        *struct {
+				Enabled    bool     `json:"enabled"`
+				ServerName string   `json:"server_name"`
+				Insecure   bool     `json:"insecure"`
+				Alpn       []string `json:"alpn"`
+				UTLS       *struct {
+					Enabled     bool   `json:"enabled"`
+					Fingerprint string `json:"fingerprint"`
+				} `json:"utls"`
+			} `json:"tls"`
+			Transport *struct {
+				Type                string            `json:"type"`
+				Path                string            `json:"path"`
+				ServiceName         string            `json:"service_name"`
+				Headers             map[string]string `json:"headers"`
+				MaxEarlyData        int               `json:"max_early_data"`
+				EarlyDataHeaderName string            `json:"early_data_header_name"`
+			} `json:"transport"`
+		} `json:"outbounds"`
+	}
+	if err := json.Unmarshal([]byte(body), &cfg); err != nil {
+		return nil, err
+	}
+
+	var nodes []vlessNode
+	for _, ob := range cfg.Outbounds {
+		proto := ob.Type
+		switch proto {
+		case "vless", "vmess", "trojan", "shadowsocks":
+		default:
+			continue
+		}
+		if ob.Server == "" || ob.ServerPort == nil {
+			continue
+		}
+
+		port := 443
+		switch p := ob.ServerPort.(type) {
+		case float64:
+			port = int(p)
+		case string:
+			port, _ = strconvAtoi(p)
+		}
+
+		n := vlessNode{
+			Address: ob.Server,
+			Port:    port,
+			Name:    ob.Tag,
+			Proto:   proto,
+			Network: "tcp",
+		}
+
+		switch proto {
+		case "shadowsocks":
+			n.SSMethod = ob.Method
+			n.SSPass = ob.Password
+		case "trojan":
+			n.UUID = ob.Password
+		default:
+			n.UUID = ob.UUID
+		}
+
+		if t := ob.Transport; t != nil {
+			switch t.Type {
+			case "ws":
+				n.Network = "ws"
+				n.Path = t.Path
+				if n.Path == "" {
+					n.Path = "/"
+				}
+				if t.Headers != nil {
+					n.Host = t.Headers["Host"]
+				}
+				n.MaxEarlyData = t.MaxEarlyData
+				n.EarlyDataHeader = t.EarlyDataHeaderName
+			case "grpc":
+				n.Network = "grpc"
+				n.Path = t.ServiceName
+			default:
+				if t.Type != "" && t.Type != "tcp" {
+					n.Network = t.Type
+				}
+			}
+		}
+
+		if ob.TLS != nil && ob.TLS.Enabled {
+			n.TLS = true
+			n.SNI = ob.TLS.ServerName
+			if n.SNI == "" {
+				n.SNI = ob.Server
+			}
+			if ob.TLS.UTLS != nil && ob.TLS.UTLS.Enabled {
+				n.FP = ob.TLS.UTLS.Fingerprint
+			}
+			if len(ob.TLS.Alpn) > 0 {
+				n.Alpn = ob.TLS.Alpn[0]
+			}
+		}
+
+		nodes = append(nodes, n)
 	}
 	return nodes, nil
 }
@@ -1065,6 +1201,12 @@ func buildSingBoxOutbound(tag string, n vlessNode) map[string]any {
 		}
 		if n.Host != "" {
 			transportCfg["headers"] = map[string]any{"Host": n.Host}
+		}
+		if n.MaxEarlyData > 0 {
+			transportCfg["max_early_data"] = n.MaxEarlyData
+		}
+		if n.EarlyDataHeader != "" {
+			transportCfg["early_data_header_name"] = n.EarlyDataHeader
 		}
 		ob["transport"] = transportCfg
 	} else if n.Network == "grpc" {
