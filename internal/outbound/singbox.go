@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -39,13 +40,29 @@ const (
 
 	// Health check constants.
 	healthCheckInterval = 60 * time.Second // check every 60s
-	healthCheckTimeout  = 10 * time.Second // per-node check timeout
-	healthMaxFailures   = 3                // consecutive failures before isolating
-	healthCheckURL      = "https://www.gstatic.com/generate_204"
+	healthCheckTimeout  = 8 * time.Second  // per-node egress probe timeout
+	healthMaxFailures   = 3                // consecutive soft failures before banning
+	// restartCooldown is the minimum spacing between sing-box restarts so a
+	// crash loop cannot spawn processes in a hot loop.
+	restartCooldown = 10 * time.Second
+	// healthProbeDefault is the upstream the gateway actually dials. Probing
+	// the real M365 egress host (instead of gstatic) means an HTTP response
+	// of ANY status < 500 proves the TCP+TLS+proxy path to Microsoft works,
+	// while 403/429 from the CDN means this exit IP is blocked.
+	healthProbeDefault = "https://substrate.office.com/"
 )
+
+// healthProbeURL returns the egress probe target, overridable by operators.
+func healthProbeURL() string {
+	if v := strings.TrimSpace(os.Getenv("M365_PROXY_HEALTH_URL")); v != "" {
+		return v
+	}
+	return healthProbeDefault
+}
 
 var (
 	sbMu          sync.Mutex
+	sbLifecycleMu sync.Mutex // serialises all process start/stop (configure/refresh/replace/stop)
 	sbConfig      *SingBoxConfig
 	sbProcess     *exec.Cmd
 	sbClients     *Clients            // clients pointed at the local sing-box SOCKS5 (urltest / fallback)
@@ -54,7 +71,35 @@ var (
 	sbNodePorts   map[int]int         // node index → local SOCKS5 port
 	sbNodeHealth  map[int]*nodeHealth // per-node health state
 	sbHealthStop  chan struct{}       // stop signal for health check goroutine
+	sbRefreshStop chan struct{}       // stop signal for the auto-refresh goroutine
+	sbLastStart   time.Time           // last sing-box start (restart debounce)
+	// sbReplacing is the coalescing latch for replacement restarts: while a
+	// replace is scheduled or in flight, further bans fold into it instead of
+	// stacking additional subscription fetches + process swaps. Guarded by sbMu.
+	sbReplacing bool
+
+	// bannedEgresses persists banned upstream exit addresses across sing-box
+	// restarts so the same dead IP is never re-selected for a port.
+	sbBannedEgresses map[string]bool
+	// sbEgressAddrs maps node index → upstream Address, used to record a ban
+	// against the address rather than the volatile port/index.
+	sbEgressAddrs map[int]string
 )
+
+// onNodeBannedFn is the ban联动 callback (set via SetOnNodeBanned). It is
+// invoked asynchronously with the banned node index and reason so callers can
+// rebind accounts/credentials that were pinned to the dead egress.
+var (
+	onNodeBannedMu sync.Mutex
+	onNodeBannedFn func(idx int, reason string)
+)
+
+// SetOnNodeBanned registers the ban联动 callback.
+func SetOnNodeBanned(fn func(idx int, reason string)) {
+	onNodeBannedMu.Lock()
+	onNodeBannedFn = fn
+	onNodeBannedMu.Unlock()
+}
 
 func defaultSingBoxConfig() *SingBoxConfig {
 	port := defaultLocalPort
@@ -63,9 +108,15 @@ func defaultSingBoxConfig() *SingBoxConfig {
 			// ok
 		}
 	}
-	dir := "/tmp/sing-box-config"
-	if d := os.Getenv(envConfigDir); d != "" {
-		dir = d
+	dir := os.Getenv(envConfigDir)
+	if dir == "" {
+		// Per-instance private temp dir: a fixed /tmp path plus world-readable
+		// config would expose plaintext proxy credentials.
+		if d, err := os.MkdirTemp("", "singbox-"); err == nil {
+			dir = d
+		} else {
+			dir = filepath.Join(os.TempDir(), fmt.Sprintf("sing-box-config-%d", time.Now().UnixNano()))
+		}
 	}
 	bin := defaultBinary
 	if b := os.Getenv(envBinaryPath); b != "" {
@@ -81,8 +132,16 @@ func defaultSingBoxConfig() *SingBoxConfig {
 
 // ConfigureSingBox fetches the subscription, parses nodes, generates a
 // sing-box config, starts sing-box, and wires HTTPClient/WebSocketDialer
-// to the local SOCKS5 port.
+// to the local SOCKS5 port. It serialises against every other process
+// lifecycle operation (refresh, replacement, stop) so concurrent callers can
+// never fight over the shared local port.
 func ConfigureSingBox(subscriptionURL string) error {
+	sbLifecycleMu.Lock()
+	defer sbLifecycleMu.Unlock()
+	return configureSingBoxLocked(subscriptionURL)
+}
+
+func configureSingBoxLocked(subscriptionURL string) error {
 	cfg := defaultSingBoxConfig()
 	cfg.SubscriptionURL = subscriptionURL
 
@@ -94,7 +153,7 @@ func ConfigureSingBox(subscriptionURL string) error {
 		return fmt.Errorf("sing-box: subscription returned 0 nodes")
 	}
 
-	selected, err := writeSingBoxConfig(cfg, nodes)
+	selected, err := writeSingBoxConfig(cfg, nodes, nil)
 	if err != nil {
 		return fmt.Errorf("sing-box: write config: %w", err)
 	}
@@ -108,6 +167,9 @@ func ConfigureSingBox(subscriptionURL string) error {
 	sbNodeClients = nil
 	sbNodePorts = nil
 	sbNodeHealth = nil
+	sbBannedEgresses = make(map[string]bool)
+	sbEgressAddrs = make(map[int]string)
+	sbLastStart = time.Now()
 	sbMu.Unlock()
 	if oldProc != nil && oldProc.Process != nil {
 		_ = oldProc.Process.Signal(os.Interrupt)
@@ -158,10 +220,12 @@ func ConfigureSingBox(subscriptionURL string) error {
 	// Build per-node clients (each port → specific exit IP)
 	nodeClients := make(map[int]*Clients, len(selected))
 	nodePorts := make(map[int]int, len(selected))
+	egressAddrs := make(map[int]string, len(selected))
 	for i := range selected {
 		port := cfg.LocalPort + 1 + i
 		nodeClients[i] = buildLocalSOCKS5Clients(port)
 		nodePorts[i] = port
+		egressAddrs[i] = selected[i].Address
 	}
 
 	// Initialize per-node health state
@@ -179,6 +243,7 @@ func ConfigureSingBox(subscriptionURL string) error {
 	sbNodeClients = nodeClients
 	sbNodePorts = nodePorts
 	sbNodeHealth = nodeHealthMap
+	sbEgressAddrs = egressAddrs
 	sbMu.Unlock()
 
 	// Start background health checks
@@ -187,18 +252,30 @@ func ConfigureSingBox(subscriptionURL string) error {
 	log.Printf("[sing-box] started with %d nodes on port %d (per-node ports %d-%d)", len(selected), cfg.LocalPort, cfg.LocalPort+1, cfg.LocalPort+len(selected))
 
 	// Wait for sing-box in background; restart on exit
-	go func() {
-		err := cmd.Wait()
-		log.Printf("[sing-box] process exited: %v", err)
-		sbMu.Lock()
-		if sbProcess == cmd {
-			sbProcess = nil
-		}
-		// CRITICAL: When sing-box crashes (e.g., config error), we must
-		// clear all clients so that HTTPClient()/WebSocketDialer() fall
-		// back to direct connection instead of trying to connect to dead
-		// SOCKS5 ports, which causes "connection refused" and 502 errors.
-		// Keep sbNodeList for status display, but mark all nodes offline.
+	go watchSingBoxProcess(cmd)
+
+	// Start auto-refresh goroutine (stops the previous one so repeated
+	// reconfigures do not leak refresh loops).
+	startRefreshLoop(cfg)
+
+	return nil
+}
+
+// watchSingBoxProcess waits for a sing-box process to exit and, if it was the
+// current one, clears the client/health state (so callers fall back instead of
+// dialing dead SOCKS5 ports) and triggers a debounced crash restart. It is the
+// single watcher used by configure/reload/rebuild so crash handling is uniform.
+func watchSingBoxProcess(cmd *exec.Cmd) {
+	err := cmd.Wait()
+	log.Printf("[sing-box] process exited: %v", err)
+	sbMu.Lock()
+	isCurrent := sbProcess == cmd
+	if isCurrent {
+		sbProcess = nil
+		// CRITICAL: When sing-box crashes (e.g., config error), we must clear
+		// all clients so HTTPClient()/WebSocketDialer() fall back to direct
+		// connection instead of dialing dead SOCKS5 ports. Keep sbNodeList
+		// for status display, but mark all nodes offline.
 		sbClients = nil
 		sbNodeClients = nil
 		sbNodePorts = nil
@@ -210,13 +287,24 @@ func ConfigureSingBox(subscriptionURL string) error {
 				nh.mu.Unlock()
 			}
 		}
-		sbMu.Unlock()
-	}()
+	}
+	sbMu.Unlock()
+	if isCurrent {
+		tryRestartSingBox()
+	}
+}
 
-	// Start auto-refresh goroutine
-	go refreshLoop(cfg)
-
-	return nil
+// startRefreshLoop (re)starts the 10-minute subscription refresh goroutine,
+// signalling any previous loop to exit first.
+func startRefreshLoop(cfg *SingBoxConfig) {
+	stop := make(chan struct{})
+	sbMu.Lock()
+	if sbRefreshStop != nil {
+		close(sbRefreshStop)
+	}
+	sbRefreshStop = stop
+	sbMu.Unlock()
+	go refreshLoop(cfg, stop)
 }
 
 // waitPortReleased polls until nothing listens on addr or timeout passes.
@@ -234,13 +322,37 @@ func waitPortReleased(addr string, timeout time.Duration) {
 	}
 }
 
+// stopProcessAndWaitPort signals a sing-box process to stop, force-kills it
+// after a grace period, and then waits until its listening port is released.
+// It deliberately does NOT call cmd.Wait(): the process always has a dedicated
+// watchSingBoxProcess goroutine that owns Wait(), and a second concurrent
+// Wait() on the same *exec.Cmd races on ProcessState. Port release is a
+// sufficient signal that the listener is gone.
+func stopProcessAndWaitPort(cmd *exec.Cmd, socksAddr string) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Signal(os.Interrupt)
+	// Give graceful shutdown a moment, then force-kill.
+	time.Sleep(150 * time.Millisecond)
+	_ = cmd.Process.Kill()
+	// Wait for the port to be released (bounded).
+	waitPortReleased(socksAddr, 4*time.Second)
+}
+
 func StopSingBox() {
 	stopSingBox()
 }
 
 func stopSingBox() {
+	sbLifecycleMu.Lock()
+	defer sbLifecycleMu.Unlock()
 	stopHealthChecks()
 	sbMu.Lock()
+	if sbRefreshStop != nil {
+		close(sbRefreshStop)
+		sbRefreshStop = nil
+	}
 	defer sbMu.Unlock()
 	if sbProcess != nil && sbProcess.Process != nil {
 		_ = sbProcess.Process.Signal(os.Interrupt)
@@ -251,12 +363,49 @@ func stopSingBox() {
 	sbNodeClients = nil
 	sbNodePorts = nil
 	sbNodeHealth = nil
+	sbEgressAddrs = nil
+	// Clear the replacement latch: a pending replace would otherwise block all
+	// future replacement restarts after this stop.
+	sbReplacing = false
+	// Remove the per-instance config dir (Start recreates it): it holds
+	// plaintext proxy credentials.
+	if sbConfig != nil && sbConfig.ConfigDir != "" {
+		_ = os.RemoveAll(sbConfig.ConfigDir)
+	}
 }
 
-func refreshLoop(cfg *SingBoxConfig) {
+// tryRestartSingBox reconfigures sing-box from the last subscription after a
+// crash, respecting restartCooldown so a crash loop cannot spawn processes in a
+// hot loop. It is a no-op when no subscription is known.
+func tryRestartSingBox() {
+	sbMu.Lock()
+	cfg := sbConfig
+	lastStart := sbLastStart
+	sbMu.Unlock()
+	if cfg == nil || cfg.SubscriptionURL == "" {
+		return
+	}
+	if !lastStart.IsZero() && time.Since(lastStart) < restartCooldown {
+		log.Printf("[sing-box] skip crash restart (debounce: %s since last start)", time.Since(lastStart).Round(time.Millisecond))
+		return
+	}
+	sbLifecycleMu.Lock()
+	defer sbLifecycleMu.Unlock()
+	log.Printf("[sing-box] attempting crash restart from subscription")
+	if err := configureSingBoxLocked(cfg.SubscriptionURL); err != nil {
+		log.Printf("[sing-box] crash restart failed: %v", err)
+	}
+}
+
+func refreshLoop(cfg *SingBoxConfig, stop chan struct{}) {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+		}
 		nodes, err := fetchSubscription(cfg.SubscriptionURL)
 		if err != nil {
 			log.Printf("[sing-box] refresh failed: %v", err)
@@ -265,132 +414,212 @@ func refreshLoop(cfg *SingBoxConfig) {
 		if len(nodes) == 0 {
 			continue
 		}
-		selected, err := writeSingBoxConfig(cfg, nodes)
-		if err != nil {
-			log.Printf("[sing-box] refresh write config failed: %v", err)
-			continue
-		}
-		if len(selected) == 0 {
-			continue
-		}
-		// Validate config before starting the reload process.
-		configPath := filepath.Join(cfg.ConfigDir, "config.json")
-		checkCmd := exec.Command(cfg.BinaryPath, "check", "-c", configPath)
-		checkOutput, checkErr := checkCmd.CombinedOutput()
-		if checkErr != nil {
-			log.Printf("[sing-box] reload config validation failed: %s: %v",
-				strings.TrimSpace(string(checkOutput)), checkErr)
-			continue
-		}
-
-		// The old code started the new process BEFORE killing the old one
-		// "to avoid a gap" — but both bind the same LocalPort, so the new
-		// process always died on EADDRINUSE while the readiness probe
-		// happily connected to the OLD listener. The swap then killed the
-		// old owner and left sbClients pointing at a dead socket until the
-		// next 10-minute refresh: a guaranteed proxy-wide outage window.
-		// Correct order: stop old -> confirm the port is released -> start
-		// new -> verify it actually owns the port -> swap in clients.
-		socksAddr := fmt.Sprintf("127.0.0.1:%d", cfg.LocalPort)
-		sbMu.Lock()
-		oldCmd := sbProcess
-		sbProcess = nil
-		sbClients = nil
-		sbNodeClients = nil
-		sbNodePorts = nil
-		sbMu.Unlock()
-		if oldCmd != nil && oldCmd.Process != nil {
-			_ = oldCmd.Process.Signal(os.Interrupt)
-			// Give graceful shutdown a beat, then force-kill.
-			done := make(chan struct{})
-			go func(c *exec.Cmd) { _ = c.Wait(); close(done) }(oldCmd)
-			select {
-			case <-done:
-			case <-time.After(2 * time.Second):
-				_ = oldCmd.Process.Kill()
-				<-done
-			}
-		}
-		// Wait until nothing is listening on the port any more.
-		released := false
-		for i := 0; i < 40; i++ {
-			conn, derr := net.Dial("tcp", socksAddr)
-			if derr != nil {
-				released = true
-				break
-			}
-			conn.Close()
-			time.Sleep(100 * time.Millisecond)
-		}
-		if !released {
-			log.Printf("[sing-box] reload: port %d still busy after old process stop; skipping this refresh", cfg.LocalPort)
-			continue
-		}
-		reloadCmd := exec.Command(cfg.BinaryPath, "run", "-c", configPath)
-		reloadCmd.Stdout = os.Stdout
-		reloadCmd.Stderr = os.Stderr
-		if err := reloadCmd.Start(); err != nil {
-			log.Printf("[sing-box] reload start failed (proxy left offline): %v", err)
-			continue
-		}
-		// Wait briefly for the NEW process to bind the port.
-		ready := false
-		for i := 0; i < 30; i++ {
-			if conn, derr := net.Dial("tcp", socksAddr); derr == nil {
-				conn.Close()
-				ready = true
-				break
-			}
-			time.Sleep(200 * time.Millisecond)
-		}
-		if !ready {
-			_ = reloadCmd.Process.Kill()
-			_ = reloadCmd.Wait()
-			log.Printf("[sing-box] reload: new process failed to bind port %d; proxy offline until next refresh", cfg.LocalPort)
-			continue
-		}
-		// Build per-node clients for the refreshed node set
-		nodeClients := make(map[int]*Clients, len(selected))
-		nodePorts := make(map[int]int, len(selected))
-		nodeHealthMap := make(map[int]*nodeHealth, len(selected))
-		for i := range selected {
-			port := cfg.LocalPort + 1 + i
-			nodeClients[i] = buildLocalSOCKS5Clients(port)
-			nodePorts[i] = port
-			nodeHealthMap[i] = newNodeHealth()
-		}
-		sbMu.Lock()
-		sbProcess = reloadCmd
-		sbNodeList = nodeNames(selected)
-		sbClients = buildLocalSOCKS5Clients(cfg.LocalPort)
-		sbNodeClients = nodeClients
-		sbNodePorts = nodePorts
-		sbNodeHealth = nodeHealthMap
-		sbMu.Unlock()
-		// Restart health checks for the new node set
-		startHealthChecks()
-		log.Printf("[sing-box] refreshed with %d nodes", len(selected))
-		go func(c *exec.Cmd) {
-			err := c.Wait()
-			log.Printf("[sing-box] reloaded process exited: %v", err)
-			sbMu.Lock()
-			if sbProcess == c {
-				sbProcess = nil
-				sbClients = nil
-				sbNodeClients = nil
-				sbNodePorts = nil
-				for _, nh := range sbNodeHealth {
-					if nh != nil {
-						nh.mu.Lock()
-						nh.health = "offline"
-						nh.lastError = "sing-box process exited"
-						nh.mu.Unlock()
-					}
-				}
-			}
-			sbMu.Unlock()
-		}(reloadCmd)
+		// Serialise against replacement/configure: only one process swap may run
+		// at a time or they fight over the shared local port.
+		sbLifecycleMu.Lock()
+		reloadOnce(cfg, nodes)
+		sbLifecycleMu.Unlock()
 	}
+}
+
+// reloadOnce performs a single subscription refresh reload. It assumes the
+// caller holds the sbReplacing latch.
+func reloadOnce(cfg *SingBoxConfig, nodes []vlessNode) {
+	banned := sbBannedSnapshot()
+	selected, err := writeSingBoxConfig(cfg, nodes, banned)
+	if err != nil {
+		log.Printf("[sing-box] refresh write config failed: %v", err)
+		return
+	}
+	if len(selected) == 0 {
+		return
+	}
+	// Validate config before starting the reload process.
+	configPath := filepath.Join(cfg.ConfigDir, "config.json")
+	checkCmd := exec.Command(cfg.BinaryPath, "check", "-c", configPath)
+	checkOutput, checkErr := checkCmd.CombinedOutput()
+	if checkErr != nil {
+		log.Printf("[sing-box] reload config validation failed: %s: %v",
+			strings.TrimSpace(string(checkOutput)), checkErr)
+		return
+	}
+
+	// The old code started the new process BEFORE killing the old one
+	// "to avoid a gap" — but both bind the same LocalPort, so the new
+	// process always died on EADDRINUSE while the readiness probe
+	// happily connected to the OLD listener. The swap then killed the
+	// old owner and left sbClients pointing at a dead socket until the
+	// next 10-minute refresh: a guaranteed proxy-wide outage window.
+	// Correct order: stop old -> confirm the port is released -> start
+	// new -> verify it actually owns the port -> swap in clients.
+	socksAddr := fmt.Sprintf("127.0.0.1:%d", cfg.LocalPort)
+	sbMu.Lock()
+	oldCmd := sbProcess
+	sbProcess = nil
+	sbClients = nil
+	sbNodeClients = nil
+	sbNodePorts = nil
+	sbMu.Unlock()
+	stopProcessAndWaitPort(oldCmd, socksAddr)
+	// Wait until nothing is listening on the port any more.
+	released := false
+	for i := 0; i < 40; i++ {
+		conn, derr := net.Dial("tcp", socksAddr)
+		if derr != nil {
+			released = true
+			break
+		}
+		conn.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !released {
+		log.Printf("[sing-box] reload: port %d still busy after old process stop; skipping this refresh", cfg.LocalPort)
+		return
+	}
+	reloadCmd := exec.Command(cfg.BinaryPath, "run", "-c", configPath)
+	reloadCmd.Stdout = os.Stdout
+	reloadCmd.Stderr = os.Stderr
+	if err := reloadCmd.Start(); err != nil {
+		log.Printf("[sing-box] reload start failed (proxy left offline): %v", err)
+		return
+	}
+	// Wait briefly for the NEW process to bind the port.
+	ready := false
+	for i := 0; i < 30; i++ {
+		if conn, derr := net.Dial("tcp", socksAddr); derr == nil {
+			conn.Close()
+			ready = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !ready {
+		_ = reloadCmd.Process.Kill()
+		_ = reloadCmd.Wait()
+		log.Printf("[sing-box] reload: new process failed to bind port %d; proxy offline until next refresh", cfg.LocalPort)
+		return
+	}
+	// Build per-node clients for the refreshed node set
+	nodeClients := make(map[int]*Clients, len(selected))
+	nodePorts := make(map[int]int, len(selected))
+	nodeHealthMap := make(map[int]*nodeHealth, len(selected))
+	egressAddrs := make(map[int]string, len(selected))
+	for i := range selected {
+		port := cfg.LocalPort + 1 + i
+		nodeClients[i] = buildLocalSOCKS5Clients(port)
+		nodePorts[i] = port
+		nodeHealthMap[i] = newNodeHealth()
+		egressAddrs[i] = selected[i].Address
+	}
+	sbMu.Lock()
+	sbProcess = reloadCmd
+	sbNodeList = nodeNames(selected)
+	sbClients = buildLocalSOCKS5Clients(cfg.LocalPort)
+	sbNodeClients = nodeClients
+	sbNodePorts = nodePorts
+	sbNodeHealth = nodeHealthMap
+	sbEgressAddrs = egressAddrs
+	sbLastStart = time.Now()
+	sbMu.Unlock()
+	// Restart health checks for the new node set
+	startHealthChecks()
+	log.Printf("[sing-box] refreshed with %d nodes", len(selected))
+	go watchSingBoxProcess(reloadCmd)
+}
+
+// rebuildSingBoxWithout fetches the current subscription fresh, drops nodes
+// whose upstream Address is in banned, rewrites the config, restarts sing-box
+// and rewires the per-node clients/health maps. It is called when nodes are
+// banned so the bad ports are released and healthy spares take over.
+func rebuildSingBoxWithout(cfg *SingBoxConfig, banned map[string]bool) error {
+	nodes, err := fetchSubscription(cfg.SubscriptionURL)
+	if err != nil {
+		return fmt.Errorf("fetch subscription: %w", err)
+	}
+	if len(nodes) == 0 {
+		return fmt.Errorf("subscription returned 0 nodes")
+	}
+	selected, err := writeSingBoxConfig(cfg, nodes, banned)
+	if err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	if len(selected) == 0 {
+		return fmt.Errorf("no nodes left after excluding banned nodes")
+	}
+
+	configPath := filepath.Join(cfg.ConfigDir, "config.json")
+	if out, err := exec.Command(cfg.BinaryPath, "check", "-c", configPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("config validation failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	// Stop the current process and wait for the shared port to be released.
+	stopHealthChecks()
+	sbMu.Lock()
+	oldCmd := sbProcess
+	sbProcess = nil
+	sbClients = nil
+	sbNodeClients = nil
+	sbNodePorts = nil
+	sbMu.Unlock()
+	socksAddr := fmt.Sprintf("127.0.0.1:%d", cfg.LocalPort)
+	stopProcessAndWaitPort(oldCmd, socksAddr)
+	for i := 0; i < 40; i++ {
+		conn, derr := net.Dial("tcp", socksAddr)
+		if derr != nil {
+			break
+		}
+		_ = conn.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	cmd := exec.Command(cfg.BinaryPath, "run", "-c", configPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start sing-box: %w", err)
+	}
+	ready := false
+	for i := 0; i < 30; i++ {
+		if conn, derr := net.Dial("tcp", socksAddr); derr == nil {
+			conn.Close()
+			ready = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !ready {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("new sing-box failed to bind port %d", cfg.LocalPort)
+	}
+
+	nodeClients := make(map[int]*Clients, len(selected))
+	nodePorts := make(map[int]int, len(selected))
+	nodeHealthMap := make(map[int]*nodeHealth, len(selected))
+	egressAddrs := make(map[int]string, len(selected))
+	for i := range selected {
+		port := cfg.LocalPort + 1 + i
+		nodeClients[i] = buildLocalSOCKS5Clients(port)
+		nodePorts[i] = port
+		nodeHealthMap[i] = newNodeHealth()
+		egressAddrs[i] = selected[i].Address
+	}
+	sbMu.Lock()
+	sbProcess = cmd
+	sbNodeList = nodeNames(selected)
+	sbClients = buildLocalSOCKS5Clients(cfg.LocalPort)
+	sbNodeClients = nodeClients
+	sbNodePorts = nodePorts
+	sbNodeHealth = nodeHealthMap
+	sbEgressAddrs = egressAddrs
+	sbLastStart = time.Now()
+	sbMu.Unlock()
+	startHealthChecks()
+
+	go watchSingBoxProcess(cmd)
+
+	log.Printf("[sing-box] rebuilt with %d nodes after banning %d", len(selected), len(banned))
+	return nil
 }
 
 // buildLocalSOCKS5Clients creates Clients that route through a local SOCKS5 proxy.
@@ -852,15 +1081,31 @@ func buildSingBoxOutbound(tag string, n vlessNode) map[string]any {
 }
 
 // writeSingBoxConfig generates the sing-box config and returns the selected
-// node list so the caller can build matching per-node clients.
-func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) ([]vlessNode, error) {
-	if err := os.MkdirAll(cfg.ConfigDir, 0o755); err != nil {
+// node list so the caller can build matching per-node clients. Nodes whose
+// upstream Address is in banned are dropped so their ports are reclaimed by
+// other healthy nodes.
+func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode, banned map[string]bool) ([]vlessNode, error) {
+	if err := os.MkdirAll(cfg.ConfigDir, 0o700); err != nil {
 		return nil, err
 	}
 
 	// Use all nodes — sing-box urltest will auto-pick fastest.
-	// We also shuffle so each restart rotates the order.
+	// We also shuffle so each restart rotates the order. Banned egress
+	// addresses are removed from the candidate pool entirely.
 	selected := selectRandomNodes(nodes, maxNodeInbounds)
+	if len(banned) > 0 {
+		filtered := selected[:0]
+		for _, n := range selected {
+			if banned[n.Address] {
+				continue
+			}
+			filtered = append(filtered, n)
+		}
+		selected = filtered
+	}
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("sing-box: no nodes left after excluding banned nodes")
+	}
 
 	var outbounds []map[string]any
 
@@ -878,7 +1123,7 @@ func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) ([]vlessNode, err
 		"tag":          "proxy",
 		"type":         "urltest",
 		"outbounds":    nodeTags,
-		"url":          "https://www.gstatic.com/generate_204",
+		"url":          healthProbeURL(),
 		"interval":     "5m",
 		"tolerance":    50,
 		"idle_timeout": "30m",
@@ -936,7 +1181,7 @@ func writeSingBoxConfig(cfg *SingBoxConfig, nodes []vlessNode) ([]vlessNode, err
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(configPath, b, 0o644); err != nil {
+	if err := os.WriteFile(configPath, b, 0o600); err != nil {
 		return nil, err
 	}
 	return selected, nil
@@ -966,13 +1211,14 @@ func selectRandomNodes(nodes []vlessNode, max int) []vlessNode {
 // nodeHealth tracks the health state of a single sing-box node.
 type nodeHealth struct {
 	mu         sync.Mutex
-	health     string        // "healthy", "unhealthy", "checking"
+	health     string        // "healthy", "unhealthy", "checking", "banned"
 	failures   int           // consecutive failure count
 	latency    time.Duration // last measured latency
 	lastCheck  time.Time     // last check time
 	lastError  string        // last error message
-	isolated   bool          // true when node is skipped due to failures
+	isolated   bool          // true when node is skipped due to failures/ban
 	isolatedAt time.Time     // when isolation started
+	banned     bool          // true when the exit IP is CDN-blocked (403/429)
 }
 
 // newnodeHealth creates a nodeHealth with default healthy state.
@@ -980,6 +1226,94 @@ func newNodeHealth() *nodeHealth {
 	return &nodeHealth{
 		health: "checking",
 	}
+}
+
+// probeKind classifies the outcome of an egress probe.
+type probeKind int
+
+const (
+	probeOK          probeKind = iota // response arrived from the probe target (<500)
+	probeCDNBlock                     // 403/429: exit IP blocked by the CDN
+	probeUpstreamErr                  // 5xx from the probe target
+	probeTransport                    // TCP/TLS/timeout: node could not carry traffic
+)
+
+type probeResult struct {
+	kind    probeKind
+	status  int
+	latency time.Duration
+	err     error
+}
+
+// probeCnbRequest performs one small, non-keep-alive GET through the node's
+// SOCKS5 client. It is deliberately bounded to healthCheckTimeout and never
+// reuses connections so a half-dead tunnel cannot masquerade as healthy by
+// serving a pooled response.
+func probeCnbRequest(client *http.Client) probeResult {
+	if client == nil {
+		return probeResult{kind: probeTransport, err: fmt.Errorf("nil http client")}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthProbeURL(), nil)
+	if err != nil {
+		return probeResult{kind: probeTransport, err: err}
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	// Clone the transport so DisableKeepAlives applies to this probe only and
+	// does not mutate the shared per-node transport.
+	base := client.Transport
+	var tr http.RoundTripper
+	if t, ok := base.(*http.Transport); ok && t != nil {
+		clone := t.Clone()
+		clone.DisableKeepAlives = true
+		tr = clone
+	} else {
+		tr = base
+	}
+	probeClient := &http.Client{Transport: tr, Timeout: healthCheckTimeout}
+
+	start := time.Now()
+	resp, err := probeClient.Do(req)
+	latency := time.Since(start)
+	if err != nil {
+		return probeResult{kind: probeTransport, latency: latency, err: err}
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	switch {
+	case resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests:
+		return probeResult{kind: probeCDNBlock, status: resp.StatusCode, latency: latency}
+	case resp.StatusCode < 500:
+		return probeResult{kind: probeOK, status: resp.StatusCode, latency: latency}
+	default:
+		return probeResult{kind: probeUpstreamErr, status: resp.StatusCode, latency: latency}
+	}
+}
+
+// probeEgress is the two-step health test for one node:
+//  1. TCP connect to the node's local SOCKS5 port (proves the sing-box
+//     process is alive and the inbound is listening);
+//  2. a real egress GET through that port to the M365 upstream.
+//
+// Step 2 distinguishes a genuinely working tunnel from an inbound that
+// accepts connections while the upstream is dead.
+func probeEgress(idx int, clients *Clients, port int) probeResult {
+	socksAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	tcpStart := time.Now()
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	conn, err := dialer.Dial("tcp", socksAddr)
+	if err != nil {
+		return probeResult{kind: probeTransport, latency: time.Since(tcpStart), err: fmt.Errorf("tcp connect to %s: %w", socksAddr, err)}
+	}
+	_ = conn.Close()
+
+	res := probeCnbRequest(clients.HTTP)
+	if res.err != nil {
+		res.err = fmt.Errorf("egress probe through node %d (port %d) failed for %s: %w", idx, port, healthProbeURL(), res.err)
+	}
+	return res
 }
 
 // startHealthChecks launches a background goroutine that periodically
@@ -1027,12 +1361,22 @@ func stopHealthChecks() {
 	sbMu.Unlock()
 }
 
-// checkAllNodes runs a health check against every node concurrently.
+// checkAllNodes runs a health check against every node concurrently. When a
+// node is banned (CDN-blocked exit IP) the whole sing-box config is rebuilt
+// without that node so its port is released and a healthy node takes over.
 func checkAllNodes() {
 	sbMu.Lock()
 	nodes := make([]int, 0, len(sbNodeClients))
 	for idx := range sbNodeClients {
 		nodes = append(nodes, idx)
+	}
+	clientsSnapshot := make(map[int]*Clients, len(sbNodeClients))
+	portSnapshot := make(map[int]int, len(sbNodePorts))
+	for idx, c := range sbNodeClients {
+		clientsSnapshot[idx] = c
+	}
+	for idx, p := range sbNodePorts {
+		portSnapshot[idx] = p
 	}
 	sbMu.Unlock()
 	if len(nodes) == 0 {
@@ -1043,96 +1387,213 @@ func checkAllNodes() {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			checkNodeHealth(idx)
+			checkNodeHealth(idx, clientsSnapshot[idx], portSnapshot[idx])
 		}(idx)
 	}
 	wg.Wait()
 }
 
-// checkNodeHealth checks a single node's health.
+// checkNodeHealth runs the two-step health test for a single node and returns
+// a non-empty ban reason when the node's exit IP must be dropped immediately.
 //
-// Following cnb2api's approach: do a TCP connectivity test to the
-// SOCKS5 port instead of an HTTP request. This avoids false negatives
-// where the proxy works fine but the health-check target (e.g.
-// gstatic.com) returns 403 through CF nodes.
-//
-// The TCP check confirms:
-// 1. sing-box is running and the per-node SOCKS5 port is listening
-// 2. The proxy handshake completes
-// 3. The upstream node is reachable
-//
-// HTTP-based health checks caused mass false-failures because CF
-// (Cloudflare) proxy nodes return 403 for gstatic.com, even though
-// the proxy works perfectly for substrate.office.com.
-func checkNodeHealth(idx int) {
+// Step 1 — TCP connect to the node's local SOCKS5 port (sing-box alive).
+// Step 2 — a real egress GET through that port to the M365 upstream:
+//   - 403/429 means the CDN is blocking this exit IP → ban immediately;
+//   - any other HTTP status < 500 means the request reached M365 → healthy;
+//   - transport error / timeout → soft failure, counted toward healthMaxFailures.
+func checkNodeHealth(idx int, clients *Clients, port int) string {
 	sbMu.Lock()
-	clients, ok := sbNodeClients[idx]
-	port := sbNodePorts[idx]
 	nh, nhOk := sbNodeHealth[idx]
+	bannedAddr := sbBannedEgresses[sbEgressAddrs[idx]]
 	sbMu.Unlock()
-	if !ok || clients == nil || !nhOk || nh == nil {
-		return
+	if clients == nil || !nhOk || nh == nil {
+		return ""
 	}
 
 	nh.mu.Lock()
 	nh.health = "checking"
 	nh.mu.Unlock()
 
-	// Step 1: TCP connectivity test to the SOCKS5 port.
-	// This is the primary health signal — if the port is unreachable,
-	// sing-box is dead or the node is broken.
-	socksAddr := fmt.Sprintf("127.0.0.1:%d", port)
-	tcpStart := time.Now()
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	tcpConn, err := dialer.Dial("tcp", socksAddr)
-	if err != nil {
-		recordNodeFailure(idx, fmt.Errorf("tcp connect to %s: %w", socksAddr, err))
-		return
-	}
-	tcpConn.Close()
-	latency := time.Since(tcpStart)
+	res := probeEgress(idx, clients, port)
+	switch res.kind {
+	case probeOK:
+		nh.mu.Lock()
+		// A CDN-blocked node gets 403/429 on the probe target; if it somehow
+		// returns <500 it must NOT be resurrected on this path alone, because
+		// the ban is keyed on the exit Address and persisted. Only clear the
+		// ban when the address is no longer in the persistent ban set.
+		nh.health = "healthy"
+		nh.failures = 0
+		nh.latency = res.latency
+		nh.lastCheck = time.Now()
+		nh.lastError = ""
+		if nh.isolated && !bannedAddr {
+			nh.isolated = false
+			nh.isolatedAt = time.Time{}
+			nh.banned = false
+			log.Printf("[sing-box] node %d (port %d) recovered, latency=%s", idx, port, res.latency)
+		}
+		nh.mu.Unlock()
+		return ""
 
-	// Step 2: Egress probe THROUGH this node. TCP-to-the-local-SOCKS-port
-	// only proves sing-box's inbound is listening — a dead upstream tunnel
-	// still passes it, so the old TCP-only check let broken nodes advertise
-	// "healthy" while every chat through them failed (the observed "proxy
-	// says fine but 502 storm" pattern). Probe substrate.office.com itself:
-	// it is the exact host the gateway dials, and any HTTP status below 500
-	// (200/401/403/404...) proves the TCP+TLS+proxy path to Microsoft works.
-	if clients == nil || !nodeEgressReachable(clients.HTTP) {
-		recordNodeFailure(idx, fmt.Errorf("egress probe through node %d (port %d) failed for substrate.office.com", idx, port))
-		return
+	case probeCDNBlock:
+		reason := fmt.Sprintf("exit IP blocked by CDN (HTTP %d)", res.status)
+		banNodeLocked(idx, reason)
+		return reason
+
+	case probeUpstreamErr:
+		// A 5xx means the request REACHED the upstream through this tunnel —
+		// the proxy path works, the CDN merely errored. This is not a proxy
+		// failure, so it must not count toward a ban; only refresh latency.
+		nh.mu.Lock()
+		nh.latency = res.latency
+		nh.lastCheck = time.Now()
+		nh.lastError = fmt.Sprintf("upstream returned HTTP %d", res.status)
+		if nh.health == "checking" {
+			nh.health = "healthy"
+		}
+		nh.mu.Unlock()
+		return ""
+
+	default: // probeTransport
+		err := res.err
+		if err == nil {
+			err = fmt.Errorf("egress probe transport failure")
+		}
+		recordNodeFailure(idx, err)
+		return ""
 	}
-	nh.mu.Lock()
-	nh.health = "healthy"
-	nh.failures = 0
-	nh.latency = latency
-	nh.lastCheck = time.Now()
-	nh.lastError = ""
-	if nh.isolated {
-		log.Printf("[sing-box] node %d (port %d) recovered, latency=%s", idx, port, latency)
-		nh.isolated = false
-		nh.isolatedAt = time.Time{}
-	}
-	nh.mu.Unlock()
 }
 
-// nodeEgressReachable performs one small probe through the node's SOCKS
-// client. Status <500 (or any transport success) counts as reachable; a
-// status >=500 or transport error means the tunnel cannot carry traffic.
-func nodeEgressReachable(client *http.Client) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://substrate.office.com/", nil)
-	if err != nil {
-		return false
+// banNodeLocked is the single ban entry point: it flags a node as banned so
+// it is immediately skipped by the picker, persists the ban against the
+// upstream Address (so a restart never re-selects the same dead IP), records
+// the reason, fires the 联动 callback, and schedules a throttled replacement
+// restart that frees the bad port for a healthy node.
+func banNodeLocked(idx int, reason string) {
+	sbMu.Lock()
+	nh := sbNodeHealth[idx]
+	port := sbNodePorts[idx]
+	addr := sbEgressAddrs[idx]
+	if nh == nil {
+		sbMu.Unlock()
+		return
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
+	persistAddr := addr != "" && !sbBannedEgresses[addr]
+	if persistAddr {
+		sbBannedEgresses[addr] = true
 	}
-	resp.Body.Close()
-	return resp.StatusCode < 500
+	sbMu.Unlock()
+
+	nh.mu.Lock()
+	already := nh.banned
+	nh.banned = true
+	nh.isolated = true
+	nh.health = "banned"
+	nh.failures = healthMaxFailures
+	nh.lastError = reason
+	nh.lastCheck = time.Now()
+	if !already {
+		nh.isolatedAt = time.Now()
+	}
+	nh.mu.Unlock()
+	if !already {
+		log.Printf("[sing-box] node %d (port %d) BANNED: %s", idx, port, reason)
+	}
+	if persistAddr {
+		log.Printf("[sing-box] egress IP banned (persistent): %s", addr)
+		go scheduleReplacementRestart(reason)
+	}
+	onNodeBanned(idx, reason)
+}
+
+// onNodeBanned invokes the registered ban联动 callback asynchronously.
+func onNodeBanned(idx int, reason string) {
+	onNodeBannedMu.Lock()
+	fn := onNodeBannedFn
+	onNodeBannedMu.Unlock()
+	if fn == nil {
+		log.Printf("[sing-box] ban callback: node=%d reason=%s", idx, reason)
+		return
+	}
+	go fn(idx, reason)
+}
+
+// scheduleReplacementRestart replaces bad egresses: after the restart debounce
+// window it re-selects nodes (skipping bannedEgresses) and restarts sing-box so
+// the freed ports carry spare nodes. A replacement node that is itself bad will
+// be banned by the next health round and trigger this again, replacing until the
+// set stabilises or spares run out. The sbReplacing latch ensures only one
+// replacement restart is ever in flight, so concurrent bans cannot fight over
+// the shared local port.
+func scheduleReplacementRestart(reason string) {
+	sbMu.Lock()
+	cfg := sbConfig
+	lastStart := sbLastStart
+	// Coalesce concurrent bans: if a replacement restart is already scheduled
+	// or in flight, fold this ban into it instead of stacking another full
+	// subscription fetch + process restart (each restart briefly drops the
+	// shared port).
+	if sbReplacing {
+		sbMu.Unlock()
+		log.Printf("[sing-box] replacement restart already pending; coalescing ban (%s)", reason)
+		return
+	}
+	sbReplacing = true
+	banned := make(map[string]bool, len(sbBannedEgresses))
+	for a := range sbBannedEgresses {
+		banned[a] = true
+	}
+	sbMu.Unlock()
+	if cfg == nil {
+		sbMu.Lock()
+		sbReplacing = false
+		sbMu.Unlock()
+		return
+	}
+	wait := restartCooldown + 2*time.Second - time.Since(lastStart)
+	if wait > 0 {
+		time.Sleep(wait)
+	}
+
+	// Serialise against refresh/configure/stop: only one process swap may run
+	// at a time or they fight over the shared local port.
+	sbLifecycleMu.Lock()
+	defer sbLifecycleMu.Unlock()
+	defer func() {
+		sbMu.Lock()
+		sbReplacing = false
+		sbMu.Unlock()
+	}()
+	// Re-read the ban set: bans recorded while we waited must be honoured.
+	sbMu.Lock()
+	for a := range sbBannedEgresses {
+		banned[a] = true
+	}
+	sbMu.Unlock()
+	log.Printf("[sing-box] replacing banned egresses (%s)", reason)
+	if err := replaceBannedNodes(cfg, banned); err != nil {
+		log.Printf("[sing-box] replacement restart failed: %v", err)
+	}
+}
+
+// replaceBannedNodes re-selects nodes from the subscription while skipping
+// addresses in banned, then rebuilds if at least one usable node remains.
+func replaceBannedNodes(cfg *SingBoxConfig, banned map[string]bool) error {
+	nodes, err := fetchSubscription(cfg.SubscriptionURL)
+	if err != nil {
+		return fmt.Errorf("fetch subscription: %w", err)
+	}
+	usable := 0
+	for _, n := range nodes {
+		if !banned[n.Address] {
+			usable++
+		}
+	}
+	if usable == 0 {
+		return fmt.Errorf("no usable nodes left (%d banned)", len(banned))
+	}
+	return rebuildSingBoxWithout(cfg, banned)
 }
 
 // recordNodeFailure records a failed health check for a node and isolates
@@ -1146,19 +1607,26 @@ func recordNodeFailure(idx int, err error) {
 		return
 	}
 	nh.mu.Lock()
+	if nh.isolated {
+		nh.mu.Unlock()
+		return
+	}
 	nh.failures++
 	nh.lastCheck = time.Now()
 	nh.lastError = err.Error()
-	if nh.failures >= healthMaxFailures && !nh.isolated {
-		nh.isolated = true
-		nh.isolatedAt = time.Now()
+	reached := nh.failures >= healthMaxFailures
+	failures := nh.failures
+	if !reached {
 		nh.health = "unhealthy"
-		log.Printf("[sing-box] node %d (port %d) isolated after %d failures: %s", idx, port, nh.failures, err.Error())
-	} else if !nh.isolated {
-		nh.health = "unhealthy"
-		log.Printf("[sing-box] node %d (port %d) check failed (%d/%d): %s", idx, port, nh.failures, healthMaxFailures, err.Error())
 	}
 	nh.mu.Unlock()
+	if reached {
+		// Reached the soft-failure threshold: route through the unified ban
+		// entry so the node is dropped and its port reclaimed by a healthy one.
+		banNodeLocked(idx, fmt.Sprintf("soft failures reached %d: %s", healthMaxFailures, err.Error()))
+		return
+	}
+	log.Printf("[sing-box] node %d (port %d) check failed (%d/%d): %s", idx, port, failures, healthMaxFailures, err.Error())
 }
 
 // ---- Public API (replaces old proxy pool) ----
@@ -1186,6 +1654,7 @@ func SingBoxStatus() []map[string]any {
 			node["last_check"] = nh.lastCheck
 			node["last_error"] = nh.lastError
 			node["isolated"] = nh.isolated
+			node["banned"] = nh.banned
 			nh.mu.Unlock()
 		} else {
 			node["health"] = "unknown"
@@ -1199,28 +1668,41 @@ func SingBoxStatus() []map[string]any {
 	// Count healthy vs isolated.
 	healthy := 0
 	isolated := 0
+	bannedEgresses := 0
 	for _, nh := range sbNodeHealth {
 		if nh != nil {
 			nh.mu.Lock()
 			if nh.isolated {
 				isolated++
-			} else if nh.health == "healthy" {
+			}
+			if nh.banned {
+				bannedEgresses++
+			}
+			if !nh.isolated && nh.health == "healthy" {
 				healthy++
 			}
 			nh.mu.Unlock()
 		}
 	}
 
+	persistentBans := make([]string, 0, len(sbBannedEgresses))
+	for a := range sbBannedEgresses {
+		persistentBans = append(persistentBans, a)
+	}
+	sort.Strings(persistentBans)
+
 	status := []map[string]any{
 		{
-			"subscription":   sbConfig.SubscriptionURL,
-			"local_port":     sbConfig.LocalPort,
-			"binary":         sbConfig.BinaryPath,
-			"node_count":     len(sbNodeList),
-			"nodes":          sbNodeList,
-			"node_details":   nodes,
-			"healthy_nodes":  healthy,
-			"isolated_nodes": isolated,
+			"subscription":    sbConfig.SubscriptionURL,
+			"local_port":      sbConfig.LocalPort,
+			"binary":          sbConfig.BinaryPath,
+			"node_count":      len(sbNodeList),
+			"nodes":           sbNodeList,
+			"node_details":    nodes,
+			"healthy_nodes":   healthy,
+			"isolated_nodes":  isolated,
+			"banned_nodes":    bannedEgresses,
+			"banned_egresses": persistentBans,
 		},
 	}
 	return status
@@ -1245,16 +1727,21 @@ func SingBoxRunning() bool {
 // home = hash % total is stable across isolation state; when the home node is
 // isolated the picker walks forward to the nearest healthy node, so ONLY the
 // accounts homed on that one node move (minimal churn), and they walk back to
-// their original home as soon as it recovers. When every node is unhealthy the
-// urltest selector client is returned — account traffic never silently goes
-// direct while sing-box itself is alive. ok=false means no per-node pool (or
-// sing-box dead): callers fall back to their existing behaviour.
+// their original home as soon as it recovers. When every per-node inbound is
+// banned the urltest selector is used if sing-box is still alive; only when
+// sing-box itself is gone does the picker allow a DIRECT fallback (controlled
+// by M365_ALLOW_DIRECT_FALLBACK, default on). ok=false means no per-node pool
+// (or sing-box dead): callers fall back to their existing behaviour.
 func PickNodeForAccount(accountID string) (clients *Clients, idx int, name, health string, ok bool) {
 	sbMu.Lock()
-	defer sbMu.Unlock()
 	total := len(sbNodeClients)
 	if total == 0 {
-		return sbClients, -1, "", "", false
+		selector := sbClients
+		sbMu.Unlock()
+		if selector != nil {
+			return selector, -1, "urltest-fallback", "fallback", true
+		}
+		return directFallback(accountID)
 	}
 	home := int(stableHash(accountID) % uint64(total))
 	for i := 0; i < total; i++ {
@@ -1277,13 +1764,32 @@ func PickNodeForAccount(accountID string) (clients *Clients, idx int, name, heal
 		if node < len(sbNodeList) {
 			nm = sbNodeList[node]
 		}
+		sbMu.Unlock()
 		return c, node, nm, h, true
 	}
-	// All per-node inbounds unhealthy: use the urltest selector (it still
-	// egresses through sing-box, just picks the best tunnel itself).
-	log.Printf("[sing-box] all per-node candidates isolated; account %s falls back to urltest selector", accountID)
-	_ = home
-	return sbClients, -1, "urltest-fallback", "fallback", sbClients != nil
+	selector := sbClients
+	sbMu.Unlock()
+	// All per-node inbounds banned/unhealthy: prefer the urltest selector (it
+	// still egresses through sing-box, just picks the best tunnel itself).
+	if selector != nil {
+		log.Printf("[sing-box] all per-node candidates isolated; account %s falls back to urltest selector", accountID)
+		return selector, -1, "urltest-fallback", "fallback", true
+	}
+	// sing-box itself is gone: allow direct egress (opt-out via env).
+	return directFallback(accountID)
+}
+
+// directFallback returns the direct clients when M365_ALLOW_DIRECT_FALLBACK is
+// not disabled, otherwise ok=false so the caller fails closed. Returning direct
+// egress exposes the host's real IP to M365 and is only used when every proxy
+// node is unusable.
+func directFallback(accountID string) (*Clients, int, string, string, bool) {
+	if v := strings.TrimSpace(os.Getenv("M365_ALLOW_DIRECT_FALLBACK")); v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "no") {
+		log.Printf("[sing-box] no healthy node and direct fallback disabled; account %s has no egress", accountID)
+		return nil, -1, "", "", false
+	}
+	log.Printf("[sing-box] ALL nodes banned and sing-box down; account %s falling back to DIRECT egress", accountID)
+	return directClients(), -1, "direct-fallback", "direct", true
 }
 
 // SingBoxNodeInfo returns the node ACTUALLY selected for an account (same

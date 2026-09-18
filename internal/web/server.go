@@ -265,6 +265,12 @@ func New() (*Server, error) {
 			sessionTTL = d
 		}
 	}
+	// When a sing-box node is banned, accounts routed by hash will auto-walk
+	// to a healthy node on the next request; this callback is the hook for
+	// cache/UI invalidation and observability.
+	outbound.SetOnNodeBanned(func(idx int, reason string) {
+		log.Printf("[sing-box] node %d banned: %s", idx, reason)
+	})
 	return &Server{
 		tokens:             store,
 		accountPool:        newAccountHealth(),
@@ -2307,6 +2313,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
+		if !parsed || len(calls) == 0 {
+			if fc := fencedToolCalls(routeRes.Text, toolMaps, body.ToolChoice); len(fc) > 0 {
+				calls = fc
+				parsed = true
+			}
+		}
 		calls = filterCompletedCalls(calls, ledger)
 		calls, _ = validateCalls("router", calls)
 		if !parsed {
@@ -2316,6 +2328,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
+				if !parsed || len(calls) == 0 {
+					if fc := fencedToolCalls(repairRes.Text, toolMaps, body.ToolChoice); len(fc) > 0 {
+						calls = fc
+						parsed = true
+					}
+				}
 				calls = filterCompletedCalls(calls, ledger)
 				calls, _ = validateCalls("router", calls)
 			}
@@ -2686,7 +2704,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				if pending.Len() > 0 {
 					prose += "\n" + pending.String()
 				}
-				if prose = sanitizeToolCallText(prose, toolMaps); prose != "" {
+				if prose = sanitizeToolCallText(stripPlaceholderEchoes(prose), toolMaps); prose != "" {
 					_ = emitText(prose)
 					flushText()
 				}
@@ -2779,11 +2797,26 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.accountPool.MarkSuccess(acc.ID)
 		}
 		calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
+		if !parsed || len(calls) == 0 {
+			// The router model sometimes ignores the JSON envelope and emits a
+			// fenced or bare tool_name{...} block instead. Recover it before the
+			// repair round so a perfectly valid call is not thrown away.
+			if fc := fencedToolCalls(routeRes.Text, toolMaps, body.ToolChoice); len(fc) > 0 {
+				calls = fc
+				parsed = true
+			}
+		}
 		if !parsed {
 			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Do not invent calls; use {"calls":[]} if unrecoverable. OUTPUT:
 ` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, nsRouterOpts...)
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
+				if !parsed || len(calls) == 0 {
+					if fc := fencedToolCalls(repairRes.Text, toolMaps, body.ToolChoice); len(fc) > 0 {
+						calls = fc
+						parsed = true
+					}
+				}
 			}
 			if !parsed {
 				// Degrade: the router round produced no usable decision; fall
@@ -2793,6 +2826,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		calls = filterCompletedCalls(calls, ledger)
+		if len(calls) == 0 && fmt.Sprint(body.ToolChoice) != "none" && hasToolCallIntent(routeRes.Text, toolMaps) {
+			calls = recoverNaturalLanguageToolCalls(routeRes.Text, toolMaps, body.ToolChoice)
+		}
 		calls, _ = validateCalls("router", calls)
 		if len(calls) > 0 {
 			scope := fmt.Sprintf("%d:%v", len(body.Messages), completedCallIDs(ledger))
@@ -2814,6 +2850,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			retryRes, retryErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: retryText, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, nsRouterOpts...)
 			if retryErr == nil {
 				calls, parsed = parseModelToolDecision(retryRes.Text, toolMaps, body.ToolChoice)
+				if !parsed || len(calls) == 0 {
+					if fc := fencedToolCalls(retryRes.Text, toolMaps, body.ToolChoice); len(fc) > 0 {
+						calls = fc
+						parsed = true
+					}
+				}
 				calls = filterCompletedCalls(calls, ledger)
 				calls, _ = validateCalls("router", calls)
 				if parsed && len(calls) > 0 {
@@ -2835,7 +2877,6 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 	}
 	answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode, mcpServerURL, s.settings.get(), s.featureFlags(), localeInfo, body.Metadata != nil && body.Metadata.CopilotTempSession)
-	answerPrompt = answerReq.Text
 	var res chathub.Result
 	if body.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -2982,7 +3023,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					return
 				}
 			}
-			res.Text = sanitizePublicAssistantTextForModel(res.Text, body.Model)
+			res.Text = sanitizePublicAssistantTextForModel(stripPlaceholderEchoes(res.Text), body.Model)
 			res.Reasoning = sanitizePublicReasoningText(res.Reasoning)
 			s.accountPool.MarkSuccess(acc.ID)
 			if res.Throttling != nil && s.accountPool != nil {
@@ -3249,12 +3290,25 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		routeRes, routeErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, nativeRouterOpts...)
 		if routeErr == nil {
 			calls, parsed := parseModelToolDecision(routeRes.Text, toolMaps, body.ToolChoice)
+			if !parsed || len(calls) == 0 {
+				if fc := fencedToolCalls(routeRes.Text, toolMaps, body.ToolChoice); len(fc) > 0 {
+					calls = fc
+					parsed = true
+				}
+			}
 			if !parsed {
 				repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, nativeRouterOpts...)
 				if repairErr == nil {
 					calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
+					if !parsed || len(calls) == 0 {
+						if fc := fencedToolCalls(repairRes.Text, toolMaps, body.ToolChoice); len(fc) > 0 {
+							calls = fc
+							parsed = true
+						}
+					}
 				}
 			}
+			calls = filterCompletedCalls(calls, ledger)
 			calls, _ = validateCalls("native-recovery", calls)
 			if parsed && len(calls) > 0 {
 				scope := fmt.Sprintf("%d:%v:native-recovery", len(body.Messages), completedCallIDs(ledger))
@@ -3264,6 +3318,46 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 				_ = writeToolResponse(w, id, model, body.Stream, body.shouldSendStreamUsage(), calls, routeRes)
 				return
+			}
+		}
+	}
+	// Last resort: the reply described an action in prose (bare shell command,
+	// lone file path, "let me…" promise). Recover it directly, or nudge the
+	// model once to re-emit a real call.
+	if len(toolMaps) > 0 && fmt.Sprint(body.ToolChoice) != "none" && hasToolCallIntent(res.Text, toolMaps) {
+		if calls := recoverNaturalLanguageToolCalls(res.Text, toolMaps, body.ToolChoice); len(calls) > 0 {
+			calls = filterCompletedCalls(calls, ledger)
+			calls, _ = validateCalls("nl-recovery", calls)
+			if len(calls) > 0 {
+				log.Printf("[nl-recovery] recovered %d call(s) from prose", len(calls))
+				calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
+				_ = writeToolResponse(w, id, model, body.Stream, body.shouldSendStreamUsage(), calls, res)
+				return
+			}
+		}
+		correction := toolIntentCorrectionPrompt(prompt, res.Text, toolMaps)
+		corrOpts := []chatCallOption{}
+		if body.AccountID != "" {
+			corrOpts = append(corrOpts, withPinnedAccount())
+		}
+		if corrRes, corrErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments, LicenseType: toolCfg.LicenseType, Scenario: toolCfg.Scenario}, corrOpts...); corrErr == nil {
+			if calls := recoverNaturalLanguageToolCalls(corrRes.Text, toolMaps, body.ToolChoice); len(calls) > 0 {
+				calls = filterCompletedCalls(calls, ledger)
+				calls, _ = validateCalls("nl-correction", calls)
+				if len(calls) > 0 {
+					log.Printf("[nl-recovery] correction produced %d call(s)", len(calls))
+					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
+					_ = writeToolResponse(w, id, model, body.Stream, body.shouldSendStreamUsage(), calls, corrRes)
+					return
+				}
+			}
+			// A corrected structured call may also arrive fenced/native.
+			if rc := fencedToolCalls(corrRes.Text, toolMaps, body.ToolChoice); len(rc) > 0 {
+				rc = filterCompletedCalls(rc, ledger)
+				if calls, _ := validateCalls("nl-correction-fenced", rc); len(calls) > 0 {
+					_ = writeToolResponse(w, id, model, body.Stream, body.shouldSendStreamUsage(), calls, corrRes)
+					return
+				}
 			}
 		}
 	}
@@ -3280,7 +3374,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	if len(toolMaps) > 0 && !completionEvidenceAllows(res.Text, ledger) {
 		res.Text = "I cannot confirm completion because no matching tool results were returned. No external action has been verified."
 	}
-	res.Text = sanitizePublicAssistantTextForModel(res.Text, body.Model)
+	res.Text = sanitizePublicAssistantTextForModel(stripPlaceholderEchoes(res.Text), body.Model)
 	res.Reasoning = sanitizePublicReasoningText(res.Reasoning)
 	log.Printf("[debug] res.Text bytes=%d content=%q", len(res.Text), res.Text)
 	created := time.Now().Unix()

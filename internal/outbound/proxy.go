@@ -27,7 +27,6 @@ type Clients struct {
 var (
 	clientsMu sync.RWMutex
 	clients   = directClients()
-	proxyPool *Pool
 	// singleProxyConfigured marks Configure(raw) with a non-empty proxy,
 	// replacing the direct transport with one whose DialContext routes via
 	// that proxy. It must be distinguishable from the untouched direct
@@ -36,13 +35,13 @@ var (
 )
 
 // EgressIsDirect reports whether outbound traffic leaves this process
-// directly (no pool, no single proxy, no sing-box). Attachment-download code uses
+// directly (no single proxy, no sing-box). Attachment-download code uses
 // it to enable IP-pinned validated dialing only where such validation is
 // meaningful; behind a proxy the DNS resolution happens at the remote exit
 // and a local check could not bind the same address it resolved.
 func EgressIsDirect() bool {
 	clientsMu.RLock()
-	direct := !singleProxyConfigured && proxyPool == nil
+	direct := !singleProxyConfigured
 	clientsMu.RUnlock()
 	return direct && !SingBoxRunning()
 }
@@ -78,12 +77,7 @@ func ConfigureFromEnv() error {
 	if subURL != "" {
 		return ConfigureSingBox(subURL)
 	}
-	// Priority 2: old proxy pool (backward compat)
-	raw := strings.TrimSpace(os.Getenv("M365_PROXY_POOL"))
-	if raw != "" {
-		return ConfigurePool(strings.FieldsFunc(raw, func(r rune) bool { return r == '\n' || r == '\r' || r == ',' }))
-	}
-	// Priority 3: single proxy URL
+	// Priority 2: single proxy URL (no static pool any more)
 	return Configure(os.Getenv(EnvProxy))
 }
 func Configure(raw string) error {
@@ -94,81 +88,31 @@ func Configure(raw string) error {
 	clientsMu.Lock()
 	clients = c
 	singleProxyConfigured = raw != ""
-	proxyPool = nil
-	clientsMu.Unlock()
-	return nil
-}
-func ConfigurePool(raw []string) error {
-	p, e := NewPool(raw)
-	if e != nil {
-		return e
-	}
-	clientsMu.Lock()
-	proxyPool = p
 	clientsMu.Unlock()
 	return nil
 }
 
-func CurrentPool() *Pool { clientsMu.RLock(); defer clientsMu.RUnlock(); return proxyPool }
+// sbBannedSnapshot returns a copy of the persistently banned egress addresses.
+func sbBannedSnapshot() map[string]bool {
+	sbMu.Lock()
+	defer sbMu.Unlock()
+	out := make(map[string]bool, len(sbBannedEgresses))
+	for a := range sbBannedEgresses {
+		out[a] = true
+	}
+	return out
+}
 
 func ProxyPoolStatus() []map[string]any {
-	// Priority: sing-box status
 	sbMu.Lock()
 	sb := sbConfig
 	sbMu.Unlock()
 	if sb != nil {
 		return SingBoxStatus()
 	}
-	clientsMu.RLock()
-	p := proxyPool
-	clientsMu.RUnlock()
-	if p == nil {
-		return []map[string]any{}
-	}
-	return p.List()
+	return []map[string]any{}
 }
 
-func AddProxy(raw string) error {
-	clientsMu.RLock()
-	p := proxyPool
-	clientsMu.RUnlock()
-	if p == nil {
-		return ConfigurePool([]string{raw})
-	}
-	items := make([]string, 0)
-	for _, item := range p.List() {
-		if v, ok := item["url"].(string); ok {
-			items = append(items, v)
-		}
-	}
-	items = append(items, raw)
-	return ConfigurePool(items)
-}
-
-func RemoveProxy(raw string) error {
-	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
-	clientsMu.RLock()
-	p := proxyPool
-	clientsMu.RUnlock()
-	if p == nil {
-		return nil
-	}
-	items := make([]string, 0)
-	found := false
-	for _, item := range p.List() {
-		if v, ok := item["url"].(string); ok {
-			if strings.TrimRight(strings.TrimSpace(v), "/") == raw {
-				found = true
-				continue
-			}
-			items = append(items, v)
-		}
-	}
-	if !found {
-		return fmt.Errorf("proxy not found: %s", raw)
-	}
-	return ConfigurePool(items)
-}
 func HTTPClient() *http.Client {
 	// Priority: sing-box clients
 	sbMu.Lock()
@@ -178,11 +122,8 @@ func HTTPClient() *http.Client {
 		return sbC.HTTP
 	}
 	clientsMu.RLock()
-	p, c := proxyPool, clients.HTTP
+	c := clients.HTTP
 	clientsMu.RUnlock()
-	if p != nil {
-		return p.HTTPClient()
-	}
 	return c
 }
 func WebSocketDialer() *websocket.Dialer {
@@ -194,11 +135,8 @@ func WebSocketDialer() *websocket.Dialer {
 		return sbC.WebSocket
 	}
 	clientsMu.RLock()
-	p, c := proxyPool, clients.WebSocket
+	c := clients.WebSocket
 	clientsMu.RUnlock()
-	if p != nil {
-		return p.WebSocketDialer()
-	}
 	d := *c
 	return &d
 }

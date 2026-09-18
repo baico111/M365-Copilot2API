@@ -55,7 +55,6 @@ type runtimeSettings struct {
 	TokenCachePath             string         `json:"tokenCachePath"`
 	SessionCachePath           string         `json:"sessionCachePath"`
 	OutboundProxy              string         `json:"outboundProxy"`
-	ProxyPool                  []string       `json:"proxyPool,omitempty"`
 	ClientID                   string         `json:"clientId"`
 	Authority                  string         `json:"authority"`
 	RedirectURI                string         `json:"redirectUri"`
@@ -171,11 +170,6 @@ func validateSettings(v runtimeSettings) error {
 	if err := outbound.ValidateProxyURL(v.OutboundProxy); err != nil {
 		return err
 	}
-	for _, proxyURL := range v.ProxyPool {
-		if err := outbound.ValidateProxyURL(strings.TrimSpace(proxyURL)); err != nil {
-			return err
-		}
-	}
 	seen := make(map[string]struct{}, len(v.ModelMappings))
 	for _, mapping := range v.ModelMappings {
 		model := strings.TrimSpace(mapping.PublicModel)
@@ -239,7 +233,7 @@ func (s *settingsStore) save(v runtimeSettings) error {
 func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		jsonOut(w, map[string]any{"settings": s.settings.get(), "codexModels": configurableCodexModels, "upstreamTones": knownUpstreamTones(), "restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "proxyPool", "clientId", "authority", "redirectUri", "scope", "debugLogPath"}})
+		jsonOut(w, map[string]any{"settings": s.settings.get(), "codexModels": configurableCodexModels, "upstreamTones": knownUpstreamTones(), "restartRequiredFields": []string{"listenAddress", "configPath", "tokenCachePath", "sessionCachePath", "outboundProxy", "clientId", "authority", "redirectUri", "scope", "debugLogPath"}})
 	case http.MethodPut:
 		// 前端可能只修改一个字段（如监听地址），其余字段以零值提交。
 		// 逐字段合并到当前设置再校验，避免"改一个字段弄丢其他配置"。
@@ -265,10 +259,6 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if e := s.settings.save(v); e != nil {
-			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
-			return
-		}
-		if e := outbound.ConfigurePool(v.ProxyPool); e != nil {
 			writeOpenAIError(w, 400, "invalid_request_error", e.Error())
 			return
 		}
@@ -338,7 +328,7 @@ func currentSettings() runtimeSettings { return openSettingsStore().get() }
 // always win over values saved from the web console.
 func ApplyStartupSettingsEnv() {
 	s := openSettingsStore().get()
-	values := map[string]string{"M365_LISTEN": s.ListenAddress, "M365_CONFIG": s.ConfigPath, "M365_TOKEN_CACHE": s.TokenCachePath, "M365_SESSION_CACHE": s.SessionCachePath, outbound.EnvProxy: s.OutboundProxy, "M365_PROXY_POOL": strings.Join(s.ProxyPool, "\n"), "M365_CLIENT_ID": s.ClientID, "M365_AUTHORITY": s.Authority, "M365_REDIRECT_URI": s.RedirectURI, "M365_SCOPE": s.Scope, "M365_DEBUG_LOG": s.DebugLogPath}
+	values := map[string]string{"M365_LISTEN": s.ListenAddress, "M365_CONFIG": s.ConfigPath, "M365_TOKEN_CACHE": s.TokenCachePath, "M365_SESSION_CACHE": s.SessionCachePath, outbound.EnvProxy: s.OutboundProxy, "M365_CLIENT_ID": s.ClientID, "M365_AUTHORITY": s.Authority, "M365_REDIRECT_URI": s.RedirectURI, "M365_SCOPE": s.Scope, "M365_DEBUG_LOG": s.DebugLogPath}
 	for k, v := range values {
 		if _, exists := os.LookupEnv(k); !exists && strings.TrimSpace(v) != "" {
 			_ = os.Setenv(k, v)

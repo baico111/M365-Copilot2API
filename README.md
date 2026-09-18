@@ -506,13 +506,18 @@ sudo firewall-cmd --reload
 | `M365_ENABLE_WS_POOL` | 关闭 | 是否启用 WebSocket 连接池复用。默认关闭：池化连接会忽略请求自带的 session/conversation 参数，可能被其它会话复用，造成空补全 / 502 / 会话串号。仅当确认无多会话并发时再开启。 |
 | `M365_DISABLE_WS_POOL` | — | 兼容旧开关：设为 `1` 强制关闭连接池（优先生效，覆盖 `M365_ENABLE_WS_POOL`）。 |
 
-### 代理池与认证
+### 代理与认证
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `M365_PROXY_POOL` | 空 | 代理列表（逗号或换行分隔，支持 http / https / socks5） |
-| `M365_PROXY_INSECURE_TLS` | — | 信任自签代理证书（`1` / `true`） |
-| `M365_PROXY_HEALTH_URL` | 默认探测地址 | 代理健康检查目标 |
+| `M365_SINGBOX_SUBSCRIPTION` | 空 | sing-box 订阅地址（vless / vmess / trojan / ss）。设置后所有出站走 sing-box 多端口 SOCKS5，账户按哈希固定出口 IP。优先于单代理。 |
+| `M365_SINGBOX_BINARY` | `sing-box` | sing-box 可执行文件路径。 |
+| `M365_SINGBOX_CONFIG_DIR` | 自动临时目录 | 生成的 config.json 所在目录（默认每实例私有 0700 目录）。 |
+| `M365_SINGBOX_LOCAL_PORT` | `11080` | 本地 SOCKS5 起始端口，每节点 +1。 |
+| `M365_OUTBOUND_PROXY` | 空 | 单个出站代理（http / https / socks5），未配置 sing-box 订阅时使用。 |
+| `M365_PROXY_HEALTH_URL` | `https://substrate.office.com/` | 节点真实出口探测目标。返回 403/429 判定出口 IP 被封并立即 ban 该节点。 |
+| `M365_ALLOW_DIRECT_FALLBACK` | 允许 | 所有节点被 ban 且 sing-box 进程退出时是否允许直连。设 `0` / `false` / `no` 则失败关闭（不暴露真实出口 IP）。 |
+| `M365_PROXY_INSECURE_TLS` | — | 信任自签代理证书（`1` / `true`）。 |
 | `M365_BROWSER_CLIENT_ID` / `M365_BROWSER_AUTHORITY` / `M365_BROWSER_REDIRECT_URI` / `M365_BROWSER_SCOPE` | 内置 | 浏览器 PKCE 的 OAuth 配置 |
 | `M365_DEVICE_CLIENT_ID` / `M365_DEVICE_AUTHORITY` / `M365_DEVICE_SCOPE` | 内置 | Device Code 的 OAuth 配置 |
 | `M365_CLIENT_ID` / `M365_AUTHORITY` / `M365_REDIRECT_URI` / `M365_SCOPE` | 内置 | 兼容旧配置；流程专用变量未设置时作为回退 |

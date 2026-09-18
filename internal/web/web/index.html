@@ -1523,7 +1523,7 @@ async function loadProxies(){
       detailHtml=`<table class="table" style="margin-top:8px"><thead><tr><th>#</th><th>节点名称</th><th>端口</th><th>健康状态</th><th>延迟</th><th>失败次数</th><th>错误</th></tr></thead><tbody>`;
       for(const n of details){
         const h=n.health||'unknown';
-        const cls=h==='healthy'?'online':(h==='unhealthy'||n.isolated?'error':'warn');
+        const cls=h==='healthy'?'online':(h==='unhealthy'||n.isolated||n.banned?'error':'warn');
         const latency=n.latency_ms?n.latency_ms+'ms':'-';
         const err=n.last_error?esc(String(n.last_error).slice(0,40)):'-';
         detailHtml+=`<tr><td>${n.index}</td><td style="font-size:12px">${esc(n.name||'')}</td><td><code>${n.port||'-'}</code></td><td><span class="status ${cls}"><i></i>${h}</span></td><td style="font-size:12px">${latency}</td><td style="font-size:12px">${n.failures||0}</td><td style="font-size:11px;color:var(--muted);max-width:200px;overflow:hidden;text-overflow:ellipsis">${err}</td></tr>`;

@@ -140,12 +140,15 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 }
 func normalizeFailure(s string) string {
 	s = strings.ToLower(s)
-	s = regexp.MustCompile(`\d+`).ReplaceAllString(s, "#")
+	s = failureDigitRe.ReplaceAllString(s, "#")
 	if len(s) > 500 {
 		s = s[:500]
 	}
 	return s
 }
+
+var failureDigitRe = regexp.MustCompile(`\d+`)
+
 func (l agentLedger) RouterContext() string {
 	type compact struct {
 		Completed    []toolEvidence `json:"completed"`

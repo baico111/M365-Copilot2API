@@ -37,7 +37,11 @@ func walkNative(v any, allowed map[string]bool, out *[]detectedToolCall) {
 		}
 	case map[string]any:
 		name := ""
-		for _, k := range []string{"name", "toolName", "pluginName", "functionName", "id"} {
+		// Match only name-like keys. "id" is deliberately NOT here: a ChatHub
+		// event's id (request/message/item identifier) is not a tool name, and
+		// matching it let an id that happened to equal a declared tool name
+		// plus any sibling arguments field fabricate a phantom tool call.
+		for _, k := range []string{"name", "toolName", "pluginName", "functionName"} {
 			if s, ok := x[k].(string); ok && allowed[s] {
 				name = s
 				break

@@ -2,7 +2,6 @@ package web
 
 import (
 	"context"
-	"m365-copilot2api/internal/outbound"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -78,10 +77,6 @@ func TestDeploymentCheckAddsHealthyURLToPool(t *testing.T) {
 		_, _ = w.Write([]byte("ok"))
 	}))
 	defer ts.Close()
-	if err := outbound.ConfigurePool(nil); err != nil {
-		t.Fatal(err)
-	}
-	defer outbound.ConfigurePool(nil)
 	saveEnv := os.Getenv("M365_DATA_DIR")
 	os.Setenv("M365_DATA_DIR", t.TempDir())
 	defer os.Setenv("M365_DATA_DIR", saveEnv)
@@ -95,8 +90,5 @@ func TestDeploymentCheckAddsHealthyURLToPool(t *testing.T) {
 	s.deploymentCheck(rr, req)
 	if rr.Code != 200 {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
-	}
-	if len(outbound.ProxyPoolStatus()) != 0 {
-		t.Fatalf("health-only deployment must not enter proxy pool: %#v", outbound.ProxyPoolStatus())
 	}
 }

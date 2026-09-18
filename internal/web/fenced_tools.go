@@ -9,13 +9,14 @@ import (
 var fencedToolCall = regexp.MustCompile("(?s)```([A-Za-z0-9_-]+)\\s*\\n(.*?)\\n```")
 
 // declaredShell returns the shell-ish tool name the client actually
-// declared (bash/sh/shell/powershell/cmd), or "" if none. Forcing an
-// undeclared bash call on clients that don't support it (issue #12) makes
-// them error out and loop, so conversion only happens for declared tools.
+// declared (bash/sh/shell/powershell/cmd, case-insensitively), or "" if none.
+// Forcing an undeclared bash call on clients that don't support it (issue #12)
+// makes them error out and loop, so conversion only happens for declared tools.
 func declaredShell(allowed map[string]bool) string {
-	for _, n := range []string{"bash", "sh", "shell", "powershell", "cmd"} {
-		if allowed[n] {
-			return n
+	for name := range allowed {
+		switch strings.ToLower(name) {
+		case "bash", "sh", "shell", "powershell", "cmd":
+			return name
 		}
 	}
 	return ""

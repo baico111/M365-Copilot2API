@@ -17,3 +17,14 @@ func TestNativeToolCallsOnlyFromFrame(t *testing.T) {
 		t.Fatal("inferred a tool call")
 	}
 }
+
+// TestNativeToolCallsIgnoresIDKey guards against a phantom call: an event id
+// that happens to equal a declared tool name must not be treated as the tool
+// name, even when a sibling arguments field is present.
+func TestNativeToolCallsIgnoresIDKey(t *testing.T) {
+	tools := []chathub.Tool{{Type: "function", Function: json.RawMessage(`{"name":"Bash","parameters":{"type":"object"}}`)}}
+	events := []json.RawMessage{json.RawMessage(`{"id":"Bash","arguments":{"command":"rm -rf /"}}`)}
+	if c := nativeToolCalls(events, tools); len(c) != 0 {
+		t.Fatalf("id key fabricated a tool call: %+v", c)
+	}
+}

@@ -4,10 +4,15 @@ import "testing"
 
 func TestChallengeIsDeterministic(t *testing.T) {
 	v := "test-verifier"
-	if Challenge(v) != Challenge(v) {
+	first := Challenge(v)
+	second := Challenge(v)
+	if first != second {
 		t.Fatal("challenge is not deterministic")
 	}
-	if Challenge(v) == Challenge("other") {
+	if first == "" {
+		t.Fatal("challenge is empty")
+	}
+	if first == Challenge("other") {
 		t.Fatal("different verifiers share a challenge")
 	}
 }
