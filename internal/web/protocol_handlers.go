@@ -91,6 +91,10 @@ type pipeResponseWriter struct {
 	h      http.Header
 	w      *io.PipeWriter
 	status int
+	// body captures the inner handler's response when it is a non-streaming
+	// error (status >= 400). The error JSON would otherwise be dropped by the
+	// SSE scanner, leaving only a generic "inner chat request failed" visible.
+	body bytes.Buffer
 }
 
 func (p *pipeResponseWriter) Header() http.Header { return p.h }
@@ -102,6 +106,13 @@ func (p *pipeResponseWriter) WriteHeader(n int) {
 func (p *pipeResponseWriter) Write(b []byte) (int, error) {
 	if p.status == 0 {
 		p.status = 200
+	}
+	if p.status >= http.StatusBadRequest {
+		// Bounded capture: an error body is small JSON. Guard against a
+		// misbehaving handler streaming a large 4xx/5xx body.
+		if p.body.Len() < 64<<10 {
+			p.body.Write(b)
+		}
 	}
 	return p.w.Write(b)
 }
@@ -325,7 +336,12 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 		failStream(fmt.Sprint(http.StatusBadGateway), "upstream stream interrupted: "+scanner.Err().Error())
 		return
 	case irw.status >= http.StatusBadRequest:
-		failStream(fmt.Sprint(irw.status), "inner chat request failed")
+		// Surface the inner handler's real error message instead of a generic
+		// one: the body is JSON from writeOpenAIError and the SSE scanner above
+		// already ignored it.
+		msg := errorMessage(irw.body.Bytes(), "inner chat request failed")
+		log.Printf("[responses] id=%s inner status=%d error=%q", id, irw.status, msg)
+		failStream(fmt.Sprint(irw.status), msg)
 		return
 	case sawErr != "":
 		// An error-only frame arrived after (possibly partial) text: the
