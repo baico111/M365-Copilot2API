@@ -2052,7 +2052,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 	clientPinned := body.AccountID != ""
 	body.SessionID = firstNonEmpty(body.SessionID, body.SessionIDC)
 	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), len(raw))
+	// Repair tool-protocol damage introduced by client-side history
+	// compression before validating: a single assistant turn whose tool_calls
+	// lost their results must not fail the entire request every turn.
+	if cleaned, repaired := sanitizeToolConversation(body.Messages); repaired {
+		log.Printf("[req-trace] id=%s stage=tool_protocol_repaired before=%d after=%d", requestID, len(body.Messages), len(cleaned))
+		body.Messages = cleaned
+	}
 	if err := validateToolConversation(body.Messages); err != nil {
+		log.Printf("[req-trace] id=%s stage=tool_protocol_error err=%q", requestID, err.Error())
 		writeOpenAIError(w, http.StatusBadRequest, "tool_protocol_error", err.Error())
 		return
 	}
