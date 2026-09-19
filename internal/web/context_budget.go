@@ -1,7 +1,6 @@
 package web
 
 import (
-	"fmt"
 	"strings"
 
 	"m365-copilot2api/internal/chathub"
@@ -176,14 +175,10 @@ func slidingWindow(messages []oaiMsg, budget int) ([]oaiMsg, bool, error) {
 	}
 	var p1Indices []int
 	for idx := len(atoms) - 1; idx >= 0; idx-- {
-		if atoms[idx].Kind == kindTool {
-			p1Indices = append([]int{idx}, p1Indices...)
-		} else {
-			if len(p1Indices) > 0 {
-				break
-			}
+		if atoms[idx].Kind != kindTool {
 			break
 		}
+		p1Indices = append([]int{idx}, p1Indices...)
 	}
 	sumP0P1 := requestProtocolTokens + replyPrimingTokens
 	for _, idx := range p0Indices {
@@ -195,8 +190,45 @@ func slidingWindow(messages []oaiMsg, budget int) ([]oaiMsg, bool, error) {
 	if anchorIdx != -1 {
 		sumP0P1 += atoms[anchorIdx].Tokens
 	}
+	// The pinned set (system + trailing tool atom + current task) can exceed
+	// the whole budget on its own — e.g. an agent session whose history grew
+	// past the window while the system prompt and latest tool result are each
+	// large. Hard-failing here returns 400 on every subsequent turn, which the
+	// client sees as a permanent failure and retries forever. Instead, shed
+	// the pinned parts that can be dropped, in reverse priority order:
+	//   1. the trailing tool atom (its content is the least load-bearing),
+	//   2. the anchor, but only if system+tool alone already fits,
+	//   3. nothing else — keep at least the newest anchor and one system block.
 	if sumP0P1 > budget {
-		return nil, false, fmt.Errorf("context_length_exceeded: pinned context (system+current task+anchor) %d tokens exceed budget %d; reduce tool results or start a new session", sumP0P1, budget)
+		for len(p1Indices) > 0 && sumP0P1 > budget {
+			last := p1Indices[len(p1Indices)-1]
+			sumP0P1 -= atoms[last].Tokens
+			p1Indices = p1Indices[:len(p1Indices)-1]
+		}
+	}
+	if sumP0P1 > budget && anchorIdx != -1 && len(p1Indices) == 0 {
+		// Even system + tool fits nowhere with the anchor pinned. Drop the
+		// oldest system blocks first; keep the most recent one if possible.
+		for len(p0Indices) > 1 && sumP0P1 > budget {
+			oldest := p0Indices[0]
+			sumP0P1 -= atoms[oldest].Tokens
+			p0Indices = p0Indices[1:]
+		}
+	}
+	if sumP0P1 > budget {
+		// As a last resort, keep only the current task (anchor) and the newest
+		// system block, trimming the system text itself rather than failing.
+		minimal := make([]oaiMsg, 0, 2)
+		budgetForPinned := budget - requestProtocolTokens - replyPrimingTokens
+		if budgetForPinned < 1 {
+			budgetForPinned = 1
+		}
+		if anchorIdx != -1 {
+			minimal = append(minimal, trimMessagesToBudget(atoms[anchorIdx].Msgs, budgetForPinned)...)
+		} else if len(atoms) > 0 {
+			minimal = append(minimal, trimMessagesToBudget(atoms[len(atoms)-1].Msgs, budgetForPinned)...)
+		}
+		return minimal, true, nil
 	}
 	remaining := budget - sumP0P1
 	selected := make(map[int]bool)
@@ -232,4 +264,65 @@ func slidingWindow(messages []oaiMsg, budget int) ([]oaiMsg, bool, error) {
 		truncated = true
 	}
 	return out, truncated, nil
+}
+
+// trimMessagesToBudget returns the input messages with their text content cut
+// down so the total estimated tokens fit budget. It is the last-resort path
+// when even a minimal pinned set exceeds the window; it never fails, always
+// returning at least the newest message content (possibly trimmed).
+func trimMessagesToBudget(msgs []oaiMsg, budget int) []oaiMsg {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	if budget < 1 {
+		budget = 1
+	}
+	out := make([]oaiMsg, len(msgs))
+	copy(out, msgs)
+
+	// Drop older messages entirely while over budget, keeping the last one.
+	for len(out) > 1 {
+		total := 0
+		for _, m := range out {
+			total += estimateMessageTokens(m, nil)
+		}
+		if total <= budget {
+			break
+		}
+		out = out[1:]
+	}
+
+	// Trim the remaining (newest) message content if it alone still overflows.
+	if len(out) == 1 {
+		content := messageContentString(out[0].Content)
+		tokens := estimateBudgetTokens(content)
+		if tokens > budget {
+			// Keep the tail: the end of a tool result / task is usually the
+			// most relevant part.
+			runes := []rune(content)
+			ratio := float64(budget) / float64(tokens)
+			keep := int(float64(len(runes)) * ratio)
+			if keep < 1 {
+				keep = 1
+			}
+			if keep < len(runes) {
+				out[0].Content = string(runes[len(runes)-keep:])
+			}
+		}
+	}
+	return out
+}
+
+// messageContentString renders a message's Content field as a plain string for
+// token estimation/trimming, regardless of whether it holds a string or a
+// structured content-part array.
+func messageContentString(content any) string {
+	switch v := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	default:
+		return mustJSON(v)
+	}
 }
